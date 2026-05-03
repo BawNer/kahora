@@ -115,9 +115,9 @@ func (c *Cache[K, V]) Close() {
 // shardFor returns the shard and its index for the given key.
 // Uses maphash.Comparable for zero-allocation hashing of comparable types.
 // Requires shardCount to be a power of two — enforced in WithShardCount.
-func (c *Cache[K, V]) shardFor(key K) (*shard[K, V], int) {
+func (c *Cache[K, V]) shardFor(key K) (s *shard[K, V], idx int) {
 	h := maphash.Comparable(c.seed, key)
-	idx := int(h & uint64(len(c.shards)-1))
+	idx = int(h & uint64(len(c.shards)-1))
 	return c.shards[idx], idx
 }
 
