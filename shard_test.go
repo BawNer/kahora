@@ -187,35 +187,81 @@ func TestShardShrink(t *testing.T) {
 	}
 }
 
-// TestShardShrinkDeltaMerge verifies that keys written during shrink phase 2
-// are correctly merged into the new map and not lost.
-func TestShardShrinkDeltaMerge(t *testing.T) {
-	s := newShard[string, string](0)
-	future := monoNow() + int64(1e18)
+// TestShardShrinkDeltaMergeConcurrent verifies that keys written or deleted
+// during shrink phase 2 are correctly handled in phase 3.
+// We can't reliably hit the narrow timing window from a unit test, so we
+// run many iterations with concurrent writers and check invariants hold.
+func TestShardShrinkDeltaMergeConcurrent(t *testing.T) {
+	const iterations = 50
 
-	s.set("existing", "old", future, 0, nopRecorder{}, 0)
+	for iter := range iterations {
+		s := newShard[int, int](0)
+		future := monoNow() + int64(1e18)
 
-	// Manually simulate phase 1: take snapshot, set shrinking = true.
-	s.mu.RLock()
-	snapshotTime := monoNow()
-	s.mu.RUnlock()
-	_ = snapshotTime
+		// Pre-populate with stable keys.
+		for i := range 100 {
+			s.set(i, i, future, 0, nopRecorder{}, 0)
+		}
 
-	s.shrinking.Store(true)
+		var wg sync.WaitGroup
 
-	// Write a new key while "phase 2" is in progress.
-	s.set("new_during_shrink", "fresh", future, 0, nopRecorder{}, 0)
+		// Writer: continuously sets new keys 1000-1099.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 1000; i < 1100; i++ {
+				s.set(i, i, future, 0, nopRecorder{}, 0)
+			}
+		}()
 
-	// Now run a full shrink — it should pick up the delta.
-	s.shrinking.Store(false) // reset so maybeShrink can run cleanly
-	s.maybeShrink(monoNow(), 0, nopRecorder{}, 0)
+		// Deleter: continuously deletes keys 0-49 from the pre-populated set.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 50 {
+				s.delete(i, nopRecorder{}, 0)
+			}
+		}()
 
-	v, ok := s.get("new_during_shrink", monoNow(), nopRecorder{}, 0)
-	if !ok {
-		t.Fatal("expected new_during_shrink to survive shrink")
-	}
-	if v != "fresh" {
-		t.Fatalf("expected %q, got %q", "fresh", v)
+		// Shrink concurrently with writers.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.maybeShrink(monoNow(), 0, nopRecorder{}, 0)
+		}()
+
+		wg.Wait()
+
+		// Invariants:
+		// - All deleted keys (0-49) must be absent.
+		// - All preserved keys (50-99) must be present.
+		// - All new keys (1000-1099) must be present.
+		// - count must match actual map size.
+		s.mu.RLock()
+		for i := range 50 {
+			if _, ok := s.data[i]; ok {
+				s.mu.RUnlock()
+				t.Fatalf("iter %d: deleted key %d survived shrink", iter, i)
+			}
+		}
+		for i := 50; i < 100; i++ {
+			if _, ok := s.data[i]; !ok {
+				s.mu.RUnlock()
+				t.Fatalf("iter %d: preserved key %d lost in shrink", iter, i)
+			}
+		}
+		for i := 1000; i < 1100; i++ {
+			if _, ok := s.data[i]; !ok {
+				s.mu.RUnlock()
+				t.Fatalf("iter %d: new key %d lost during shrink", iter, i)
+			}
+		}
+		actual := len(s.data)
+		s.mu.RUnlock()
+
+		if got := s.count.Load(); int(got) != actual {
+			t.Fatalf("iter %d: count %d does not match map size %d", iter, got, actual)
+		}
 	}
 }
 
