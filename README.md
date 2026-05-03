@@ -8,6 +8,7 @@ import "github.com/BawNer/kahora"
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/BawNer/kahora.svg)](https://pkg.go.dev/github.com/BawNer/kahora)
 [![Go Report Card](https://goreportcard.com/badge/github.com/BawNer/kahora)](https://goreportcard.com/report/github.com/BawNer/kahora)
+[![CI](https://github.com/BawNer/kahora/actions/workflows/ci.yml/badge.svg)](https://github.com/BawNer/kahora/actions/workflows/ci.yml)
 
 ---
 
