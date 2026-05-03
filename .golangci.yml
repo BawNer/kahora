@@ -1,12 +1,12 @@
+version: "2"
+
 run:
   timeout: 5m
-  go: "1.26"
 
 linters:
-  disable-all: true
+  default: none
   enable:
     - errcheck
-    - gosimple
     - govet
     - ineffassign
     - staticcheck
@@ -18,26 +18,25 @@ linters:
     - copyloopvar
     - gocritic
 
-linters-settings:
-  gocritic:
-    enabled-tags:
-      - performance
-      - style
-      - diagnostic
-    disabled-checks:
-      # Allow short variable names like `c`, `s`, `r` — idiomatic in this codebase.
-      - typeUnparen
-      - whyNoLint
+  settings:
+    gocritic:
+      enabled-tags:
+        - performance
+        - style
+        - diagnostic
+      disabled-checks:
+        - typeUnparen
+        - whyNoLint
 
-issues:
-  exclude-rules:
-    # Tests are allowed to be more lax.
-    - path: _test\.go
-      linters:
-        - errcheck
-        - prealloc
-    # Benchmarks intentionally discard return values.
-    - path: bench_test\.go
-      linters:
-        - errcheck
-        - gocritic
+  exclusions:
+    rules:
+      # Tests are allowed to be more lax.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - prealloc
+      # Benchmarks intentionally discard return values.
+      - path: bench_test\.go
+        linters:
+          - errcheck
+          - gocritic

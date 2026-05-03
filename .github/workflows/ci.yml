@@ -84,14 +84,16 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26.x"
+          go-version: "1.25.x"
           check-latest: true
 
+      # golangci-lint v2.11 is built with Go 1.25 — must match the toolchain.
+      # Using older v6 of the action installs v1.x which cannot read our config
+      # and does not support Go 1.26 source code.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
-          args: --timeout=5m
+          version: v2.11
 
   bench:
     name: Benchmarks (smoke)
