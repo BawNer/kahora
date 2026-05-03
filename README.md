@@ -40,7 +40,7 @@ import (
     "log"
     "time"
 
-    "github.com/your-org/kahora"
+    "github.com/BawNer/kahora"
 )
 
 func main() {
