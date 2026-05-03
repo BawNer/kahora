@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"kahora"
+	"github.com/BawNer/kahora"
 )
 
 // --- Hot path benchmarks ---

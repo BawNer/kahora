@@ -2,10 +2,11 @@ package kahora_test
 
 import (
 	"errors"
-	"kahora"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/BawNer/kahora"
 )
 
 func newCache(t *testing.T, opts ...kahora.Option) *kahora.Cache[string, string] {

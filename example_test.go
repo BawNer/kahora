@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"kahora"
+	"github.com/BawNer/kahora"
 )
 
 // ExampleNew demonstrates basic cache creation, Set, and Get.
