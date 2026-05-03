@@ -38,29 +38,32 @@ If you don't have this problem, you probably don't need kahora. `sync.Map` or a 
 package main
 
 import (
-    "log"
-    "time"
+	"fmt"
+	"log"
+	"time"
 
-    "github.com/BawNer/kahora"
+	"github.com/BawNer/kahora"
 )
 
 func main() {
-    c, err := kahora.New[string, []byte](
-        kahora.WithShardCount(kahora.ShardCountM), // 256 shards
-        kahora.WithTTL(5 * time.Minute),
-        kahora.WithActiveExpiry(30 * time.Second),
-        kahora.WithMaxEntries(10_000_000),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer c.Close()
+	c, err := kahora.New[string, []byte](
+		kahora.WithShardCount(kahora.ShardCountM), // 256 shards
+		kahora.WithTTL(5*time.Minute),
+		kahora.WithActiveExpiry(30*time.Second),
+		kahora.WithMaxEntries(10_000_000),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer c.Close()
 
-    c.Set("user:42", payload)
-
-    if v, ok := c.Get("user:42"); ok {
-        use(v)
-    }
+	data := []byte("hello world")
+	if err := c.Set("user:42", data); err != nil {
+		log.Fatal(err)
+	}
+	if v, ok := c.Get("user:42"); ok {
+		fmt.Printf("got %d bytes\n", len(v))
+	}
 }
 ```
 
