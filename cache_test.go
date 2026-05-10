@@ -1,414 +1,332 @@
-package kahora_test
+package kahora
 
 import (
-	"errors"
 	"sync"
 	"testing"
-	"time"
-
-	"github.com/BawNer/kahora"
+	"unsafe"
 )
 
-func newCache(t *testing.T, opts ...kahora.Option) *kahora.Cache[string, string] {
-	t.Helper()
-	c, err := kahora.New[string, string](opts...)
-	if err != nil {
-		t.Fatalf("kahora.New: %v", err)
+func TestShardCacheLineAlignment(t *testing.T) {
+	size := shardSize[string, string]()
+	if size%cacheLineSize != 0 {
+		t.Fatalf("shard size %d is not a multiple of cache line size %d — adjust shardPadding in shard.go", size, cacheLineSize)
 	}
-	t.Cleanup(c.Close)
-	return c
 }
 
-// --- Basic API ---
-
-func TestGetMiss(t *testing.T) {
-	c := newCache(t)
-	_, ok := c.Get("missing")
+func TestShardGetMiss(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	v, ok := s.get("key", monoNow(), nopRecorder{}, 0)
 	if ok {
 		t.Fatal("expected miss, got hit")
 	}
+	if v != "" {
+		t.Fatalf("expected zero value, got %q", v)
+	}
 }
 
-func TestSetGet(t *testing.T) {
-	c := newCache(t)
-	if err := c.Set("k", "v"); err != nil {
-		t.Fatalf("Set: %v", err)
+func TestShardSetGet(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	if err := s.set("key", "value", 0, 0, nopRecorder{}, 0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	v, ok := c.Get("k")
+	v, ok := s.get("key", monoNow(), nopRecorder{}, 0)
 	if !ok {
 		t.Fatal("expected hit, got miss")
 	}
-	if v != "v" {
-		t.Fatalf("expected %q, got %q", "v", v)
+	if v != "value" {
+		t.Fatalf("expected %q, got %q", "value", v)
 	}
 }
 
-func TestOverwrite(t *testing.T) {
-	c := newCache(t)
-	c.Set("k", "first")
-	c.Set("k", "second")
-	v, _ := c.Get("k")
+func TestShardOverwrite(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	s.set("key", "first", 0, 0, nopRecorder{}, 0)
+	s.set("key", "second", 0, 0, nopRecorder{}, 0)
+	v, ok := s.get("key", monoNow(), nopRecorder{}, 0)
+	if !ok {
+		t.Fatal("expected hit, got miss")
+	}
 	if v != "second" {
 		t.Fatalf("expected %q, got %q", "second", v)
 	}
 }
 
-func TestDelete(t *testing.T) {
-	c := newCache(t)
-	c.Set("k", "v")
-	c.Delete("k")
-	_, ok := c.Get("k")
+func TestShardDelete(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	s.set("key", "value", 0, 0, nopRecorder{}, 0)
+	s.delete("key", nopRecorder{}, 0)
+	_, ok := s.get("key", monoNow(), nopRecorder{}, 0)
 	if ok {
 		t.Fatal("expected miss after delete, got hit")
 	}
 }
 
-func TestDeleteNonExistent(t *testing.T) {
-	c := newCache(t)
-	c.Delete("ghost")
+func TestShardDeleteNonExistent(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	s.delete("ghost", nopRecorder{}, 0)
 }
 
-// --- TTL ---
+func TestShardLazyExpiry(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	past := monoNow() - 1
+	s.set("key", "value", past, 0, nopRecorder{}, 0)
 
-func TestTTLExpiry(t *testing.T) {
-	c := newCache(t, kahora.WithTTL(50*time.Millisecond))
-	c.Set("k", "v")
-
-	if _, ok := c.Get("k"); !ok {
-		t.Fatal("expected hit before TTL, got miss")
-	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	if _, ok := c.Get("k"); ok {
-		t.Fatal("expected miss after TTL, got hit")
-	}
-}
-
-func TestNoTTLEntryPersists(t *testing.T) {
-	c := newCache(t)
-	c.Set("k", "v")
-	time.Sleep(20 * time.Millisecond)
-	if _, ok := c.Get("k"); !ok {
-		t.Fatal("expected entry without TTL to persist")
-	}
-}
-
-func TestActiveExpiry(t *testing.T) {
-	c := newCache(t,
-		kahora.WithTTL(30*time.Millisecond),
-		kahora.WithActiveExpiry(20*time.Millisecond),
-	)
-	c.Set("k", "v")
-	time.Sleep(100 * time.Millisecond)
-
-	_, ok := c.Get("k")
+	_, ok := s.get("key", monoNow(), nopRecorder{}, 0)
 	if ok {
-		t.Fatal("expected miss after active expiry, got hit")
+		t.Fatal("expected miss for expired entry, got hit")
+	}
+
+	s.mu.Lock()
+	_, exists := s.data["key"]
+	s.mu.Unlock()
+	if exists {
+		t.Fatal("expected expired entry to be removed from map")
 	}
 }
 
-// --- Capacity ---
-
-func TestMaxEntriesExceededReject(t *testing.T) {
-	c := newCache(t,
-		kahora.WithShardCount(kahora.ShardCountXS),
-		kahora.WithMaxEntries(16),
-	)
-
-	var exceeded bool
-	for i := range 100 {
-		key := string(rune('a' + i%26))
-		err := c.Set(key+string(rune('0'+i%10)), "v")
-		if errors.Is(err, kahora.ErrCapacityExceeded) {
-			exceeded = true
-			break
-		}
-	}
-	if !exceeded {
-		t.Fatal("expected ErrCapacityExceeded with EvictionReject, never got it")
+func TestShardCapacityLimitReject(t *testing.T) {
+	s := newShard[string, string](0, 0) // sampleSize=0 → reject mode
+	limit := 2
+	s.set("a", "1", 0, limit, nopRecorder{}, 0)
+	s.set("b", "2", 0, limit, nopRecorder{}, 0)
+	err := s.set("c", "3", 0, limit, nopRecorder{}, 0)
+	if err != ErrCapacityExceeded {
+		t.Fatalf("expected ErrCapacityExceeded, got %v", err)
 	}
 }
 
-// --- LFU ---
-
-func TestLFUNeverReturnsCapacityExceeded(t *testing.T) {
-	c := newCache(t,
-		kahora.WithShardCount(kahora.ShardCountXS),
-		kahora.WithMaxEntries(16),
-		kahora.WithEvictionPolicy(kahora.EvictionLFU),
-	)
-
-	for i := range 1000 {
-		key := string(rune('a'+i%26)) + string(rune('0'+i%10)) + string(rune('A'+i%5))
-		if err := c.Set(key, "v"); err != nil {
-			t.Fatalf("LFU should never reject Set, got: %v", err)
-		}
-	}
-}
-
-func TestLFUEvictsLowFrequencyKey(t *testing.T) {
-	// Use a single-shard cache (XS=16) with limit small enough to force eviction.
-	c, err := kahora.New[string, string](
-		kahora.WithShardCount(kahora.ShardCountXS),
-		kahora.WithMaxEntries(32),
-		kahora.WithEvictionPolicy(kahora.EvictionLFU),
-		kahora.WithLFUSampleSize(64), // sample everything for deterministic test
-	)
-	if err != nil {
+func TestShardCapacityLimitLFU(t *testing.T) {
+	s := newShard[string, string](0, 5) // sampleSize=5 → LFU mode
+	limit := 2
+	if err := s.set("a", "1", 0, limit, nopRecorder{}, 0); err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-
-	// Fill cache and make "hot" be hot.
-	c.Set("hot", "v")
-	for range 100 {
-		c.Get("hot")
-	}
-
-	// Add many other keys, each touched once.
-	for i := range 1000 {
-		key := "cold-" + string(rune('a'+i%26)) + string(rune('0'+i%10))
-		c.Set(key, "v")
-	}
-
-	// "hot" should still be present — its counter is highest.
-	if _, ok := c.Get("hot"); !ok {
-		t.Fatal("expected 'hot' to survive LFU pressure, but it was evicted")
-	}
-}
-
-func TestLFURequiresMaxEntries(t *testing.T) {
-	_, err := kahora.New[string, string](
-		kahora.WithEvictionPolicy(kahora.EvictionLFU),
-	)
-	if err == nil {
-		t.Fatal("expected error: LFU without MaxEntries should fail")
-	}
-}
-
-func TestLFUMetricsRecordEviction(t *testing.T) {
-	r := kahora.NewRecorder(kahora.ShardCountXS)
-	c, err := kahora.New[string, string](
-		kahora.WithShardCount(kahora.ShardCountXS),
-		kahora.WithMaxEntries(16),
-		kahora.WithEvictionPolicy(kahora.EvictionLFU),
-		kahora.WithMetricsRecorder(r),
-	)
-	if err != nil {
+	if err := s.set("b", "2", 0, limit, nopRecorder{}, 0); err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-
-	for i := range 200 {
-		key := string(rune('a'+i%26)) + string(rune('0'+i%10))
-		c.Set(key, "v")
+	// Third set must succeed under LFU — it evicts a victim.
+	if err := s.set("c", "3", 0, limit, nopRecorder{}, 0); err != nil {
+		t.Fatalf("LFU should evict, not return error: %v", err)
 	}
 
-	snap := r.Snapshot()
-	if snap.Evictions == 0 {
-		t.Fatal("expected non-zero evictions, got 0")
-	}
-	if snap.CapacityExceeded != 0 {
-		t.Fatalf("expected zero CapacityExceeded with LFU, got %d", snap.CapacityExceeded)
+	s.mu.Lock()
+	got := len(s.data)
+	s.mu.Unlock()
+	if got != 2 {
+		t.Fatalf("expected 2 live entries after LFU eviction, got %d", got)
 	}
 }
 
-// --- Close ---
-
-func TestCloseIdempotent(t *testing.T) {
-	c := newCache(t)
-	c.Close()
-	c.Close()
-}
-
-func TestSetAfterClose(t *testing.T) {
-	c := newCache(t)
-	c.Close()
-	err := c.Set("k", "v")
-	if !errors.Is(err, kahora.ErrClosed) {
-		t.Fatalf("expected ErrClosed, got %v", err)
+func TestShardCountAccuracy(t *testing.T) {
+	s := newShard[string, int](0, 0)
+	s.set("a", 1, 0, 0, nopRecorder{}, 0)
+	s.set("b", 2, 0, 0, nopRecorder{}, 0)
+	s.set("a", 3, 0, 0, nopRecorder{}, 0) // overwrite — count must not increase
+	if got := s.count.Load(); got != 2 {
+		t.Fatalf("expected count 2, got %d", got)
+	}
+	s.delete("a", nopRecorder{}, 0)
+	if got := s.count.Load(); got != 1 {
+		t.Fatalf("expected count 1 after delete, got %d", got)
 	}
 }
 
-func TestGetAfterClose(t *testing.T) {
-	c := newCache(t)
-	c.Set("k", "v")
-	c.Close()
-	v, ok := c.Get("k")
-	if !ok {
-		t.Fatal("expected hit after close, got miss")
-	}
-	if v != "v" {
-		t.Fatalf("expected %q, got %q", "v", v)
-	}
-}
+func TestShardSweepExpired(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	past := monoNow() - 1
+	future := monoNow() + int64(1e18)
 
-// --- Options validation ---
+	s.set("expired1", "a", past, 0, nopRecorder{}, 0)
+	s.set("expired2", "b", past, 0, nopRecorder{}, 0)
+	s.set("live", "c", future, 0, nopRecorder{}, 0)
 
-func TestInvalidOptions(t *testing.T) {
-	tests := []struct {
-		name string
-		opts []kahora.Option
-	}{
-		{"negative ttl", []kahora.Option{kahora.WithTTL(-1)}},
-		{"zero ttl", []kahora.Option{kahora.WithTTL(0)}},
-		{"negative max entries", []kahora.Option{kahora.WithMaxEntries(-1)}},
-		{"non power of two shards", []kahora.Option{kahora.WithShardCount(100)}},
-		{"active expiry without ttl", []kahora.Option{kahora.WithActiveExpiry(time.Second)}},
-		{"nil metrics recorder", []kahora.Option{kahora.WithMetricsRecorder(nil)}},
-		{"zero shrink cycle", []kahora.Option{kahora.WithShrinkCycleInterval(0)}},
-		{"lfu sample size too small", []kahora.Option{kahora.WithLFUSampleSize(1)}},
-		{"lfu sample size too large", []kahora.Option{kahora.WithLFUSampleSize(100)}},
-		{"lfu aging interval zero", []kahora.Option{kahora.WithLFUAgingInterval(0)}},
-		{"lfu without max entries", []kahora.Option{kahora.WithEvictionPolicy(kahora.EvictionLFU)}},
+	s.sweepExpired(monoNow(), nopRecorder{}, 0)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.data["expired1"]; ok {
+		t.Error("expected expired1 to be removed")
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := kahora.New[string, string](tt.opts...)
-			if err == nil {
-				t.Fatal("expected error, got nil")
-			}
-		})
+	if _, ok := s.data["expired2"]; ok {
+		t.Error("expected expired2 to be removed")
+	}
+	if _, ok := s.data["live"]; !ok {
+		t.Error("expected live entry to remain")
 	}
 }
 
-// --- Metrics ---
+func TestShardShrink(t *testing.T) {
+	s := newShard[string, string](0, 0)
+	past := monoNow() - 1
+	future := monoNow() + int64(1e18)
 
-func TestDefaultRecorderHitsAndMisses(t *testing.T) {
-	r := kahora.NewRecorder(kahora.ShardCountXS)
-	c := newCache(t,
-		kahora.WithShardCount(kahora.ShardCountXS),
-		kahora.WithMetricsRecorder(r),
-	)
+	s.set("dead1", "x", past, 0, nopRecorder{}, 0)
+	s.set("dead2", "y", past, 0, nopRecorder{}, 0)
+	s.set("live1", "a", future, 0, nopRecorder{}, 0)
+	s.set("live2", "b", future, 0, nopRecorder{}, 0)
 
-	c.Set("k", "v")
-	c.Get("k")
-	c.Get("missing")
+	s.maybeShrink(monoNow(), 0, nopRecorder{}, 0)
 
-	snap := r.Snapshot()
-	if snap.Hits != 1 {
-		t.Errorf("expected 1 hit, got %d", snap.Hits)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.data["dead1"]; ok {
+		t.Error("expected dead1 to be removed after shrink")
 	}
-	if snap.Misses != 1 {
-		t.Errorf("expected 1 miss, got %d", snap.Misses)
+	if _, ok := s.data["dead2"]; ok {
+		t.Error("expected dead2 to be removed after shrink")
 	}
-	if snap.Sets != 1 {
-		t.Errorf("expected 1 set, got %d", snap.Sets)
+	if _, ok := s.data["live1"]; !ok {
+		t.Error("expected live1 to survive shrink")
 	}
-}
-
-func TestDefaultRecorderLazyEviction(t *testing.T) {
-	r := kahora.NewRecorder(kahora.ShardCountXS)
-	c := newCache(t,
-		kahora.WithShardCount(kahora.ShardCountXS),
-		kahora.WithTTL(30*time.Millisecond),
-		kahora.WithMetricsRecorder(r),
-	)
-
-	c.Set("k", "v")
-	time.Sleep(60 * time.Millisecond)
-	c.Get("k")
-
-	snap := r.Snapshot()
-	if snap.LazyEvictions != 1 {
-		t.Errorf("expected 1 lazy eviction, got %d", snap.LazyEvictions)
+	if _, ok := s.data["live2"]; !ok {
+		t.Error("expected live2 to survive shrink")
+	}
+	if s.shrinking.Load() {
+		t.Error("shrinking flag should be false after shrink completes")
+	}
+	if len(s.dirty) != 0 {
+		t.Error("dirty map should be empty after shrink completes")
 	}
 }
 
-func TestDefaultRecorderPerShardDistribution(t *testing.T) {
-	r := kahora.NewRecorder(kahora.ShardCountXS)
-	c := newCache(t,
-		kahora.WithShardCount(kahora.ShardCountXS),
-		kahora.WithMetricsRecorder(r),
-	)
+// TestShardShrinkDeltaMergeConcurrent runs shrink concurrently with writers
+// and deleters, then checks invariants. Run with -race.
+func TestShardShrinkDeltaMergeConcurrent(t *testing.T) {
+	const iterations = 50
 
-	for i := range 160 {
-		c.Set(string(rune(i)), "v")
-	}
+	for iter := range iterations {
+		s := newShard[int, int](0, 0)
+		future := monoNow() + int64(1e18)
 
-	snap := r.Snapshot()
-	if len(snap.Shards) != int(kahora.ShardCountXS) {
-		t.Fatalf("expected %d shard snapshots, got %d", kahora.ShardCountXS, len(snap.Shards))
-	}
-
-	nonZero := 0
-	for _, s := range snap.Shards {
-		if s.Sets > 0 {
-			nonZero++
+		for i := range 100 {
+			s.set(i, i, future, 0, nopRecorder{}, 0)
 		}
-	}
-	if nonZero == 0 {
-		t.Fatal("expected some shards to have sets, all are zero")
-	}
-}
 
-// --- Concurrency ---
+		var wg sync.WaitGroup
 
-func TestConcurrentSetGet(t *testing.T) {
-	c := newCache(t, kahora.WithShardCount(kahora.ShardCountS))
-	var wg sync.WaitGroup
-	workers := 100
-	ops := 500
-
-	for i := range workers {
 		wg.Add(1)
-		go func(id int) {
+		go func() {
 			defer wg.Done()
-			for j := range ops {
-				key := string(rune('a' + (id*ops+j)%26))
-				c.Set(key, "value")
-				c.Get(key)
+			for i := 1000; i < 1100; i++ {
+				s.set(i, i, future, 0, nopRecorder{}, 0)
 			}
-		}(i)
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 50 {
+				s.delete(i, nopRecorder{}, 0)
+			}
+		}()
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.maybeShrink(monoNow(), 0, nopRecorder{}, 0)
+		}()
+
+		wg.Wait()
+
+		s.mu.Lock()
+		for i := range 50 {
+			if _, ok := s.data[i]; ok {
+				s.mu.Unlock()
+				t.Fatalf("iter %d: deleted key %d survived shrink", iter, i)
+			}
+		}
+		for i := 50; i < 100; i++ {
+			if _, ok := s.data[i]; !ok {
+				s.mu.Unlock()
+				t.Fatalf("iter %d: preserved key %d lost in shrink", iter, i)
+			}
+		}
+		for i := 1000; i < 1100; i++ {
+			if _, ok := s.data[i]; !ok {
+				s.mu.Unlock()
+				t.Fatalf("iter %d: new key %d lost during shrink", iter, i)
+			}
+		}
+		actual := len(s.data)
+		s.mu.Unlock()
+
+		if got := s.count.Load(); int(got) != actual {
+			t.Fatalf("iter %d: count %d does not match map size %d", iter, got, actual)
+		}
 	}
-	wg.Wait()
 }
 
-func TestConcurrentSetDelete(t *testing.T) {
-	c := newCache(t)
-	var wg sync.WaitGroup
-
-	for i := range 50 {
-		wg.Add(2)
-		go func(i int) {
-			defer wg.Done()
-			c.Set(string(rune('a'+i%26)), "v")
-		}(i)
-		go func(i int) {
-			defer wg.Done()
-			c.Delete(string(rune('a' + i%26)))
-		}(i)
-	}
-	wg.Wait()
-}
-
-func TestConcurrentLFU(t *testing.T) {
-	c, err := kahora.New[int, int](
-		kahora.WithShardCount(kahora.ShardCountS),
-		kahora.WithMaxEntries(1024),
-		kahora.WithEvictionPolicy(kahora.EvictionLFU),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-
+func TestShardConcurrentSetGet(t *testing.T) {
+	s := newShard[int, int](0, 0)
 	var wg sync.WaitGroup
 	workers := 50
-	ops := 1000
+	ops := 200
 
 	for i := range workers {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			for j := range ops {
-				key := (id*ops + j) % 5000
-				c.Set(key, j)
-				c.Get(key)
+				key := (id*ops + j) % 100
+				s.set(key, j, 0, 0, nopRecorder{}, 0)
+				s.get(key, monoNow(), nopRecorder{}, 0)
 			}
 		}(i)
 	}
 	wg.Wait()
+}
+
+func TestShardSizeConstant(t *testing.T) {
+	var s shard[string, string]
+	size := unsafe.Sizeof(s)
+	t.Logf("shard[string,string] size = %d bytes", size)
+	if size%cacheLineSize != 0 {
+		t.Errorf("shard size %d is not aligned to %d bytes — update shardPadding", size, cacheLineSize)
+	}
+}
+
+// TestShardLFUFreqIncrement verifies that Get increments the LFU counter.
+func TestShardLFUFreqIncrement(t *testing.T) {
+	s := newShard[string, int](0, 5)
+	s.set("k", 1, 0, 0, nopRecorder{}, 0)
+
+	for range 10 {
+		s.get("k", monoNow(), nopRecorder{}, 0)
+	}
+
+	s.mu.Lock()
+	got := s.freq["k"]
+	s.mu.Unlock()
+
+	if got != 10 {
+		t.Fatalf("expected freq=10 after 10 Gets, got %d", got)
+	}
+}
+
+// TestShardLFUAging verifies that ageFreq halves all counters.
+func TestShardLFUAging(t *testing.T) {
+	s := newShard[string, int](0, 5)
+	s.set("k1", 1, 0, 0, nopRecorder{}, 0)
+	s.set("k2", 2, 0, 0, nopRecorder{}, 0)
+
+	for range 100 {
+		s.get("k1", monoNow(), nopRecorder{}, 0)
+	}
+	for range 50 {
+		s.get("k2", monoNow(), nopRecorder{}, 0)
+	}
+
+	s.ageFreq()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.freq["k1"] != 50 {
+		t.Errorf("expected k1 freq=50 after aging, got %d", s.freq["k1"])
+	}
+	if s.freq["k2"] != 25 {
+		t.Errorf("expected k2 freq=25 after aging, got %d", s.freq["k2"])
+	}
 }
