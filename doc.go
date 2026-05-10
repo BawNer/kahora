@@ -9,12 +9,26 @@
 // # Design
 //
 // The cache is sharded into N independent partitions (default 256).
-// Each shard has its own RWMutex, its own map, and its own atomic counters.
-// Operations on different shards never contend. Sharding uses maphash.Comparable
-// for zero-allocation key hashing.
+// Each shard has its own Mutex, its own map, and its own atomic counters.
+// Operations on different shards never contend. Sharding uses
+// maphash.Comparable for zero-allocation key hashing.
 //
 // All time measurements use a monotonic clock derived from time.Since,
 // immune to NTP adjustments and wall clock jumps.
+//
+// # Eviction policies
+//
+// Two policies are available, selected via WithEvictionPolicy:
+//
+//   - EvictionReject (default): when a shard reaches its share of maxEntries,
+//     Set returns ErrCapacityExceeded. The caller decides what to do.
+//     Lowest overhead, no per-key bookkeeping.
+//
+//   - EvictionLFU: sampled Least-Frequently-Used. Each Get increments a
+//     per-key counter; on eviction, k random entries are sampled and the
+//     one with the lowest counter is removed. Counters are halved
+//     periodically to age out historically hot keys.
+//     Requires WithMaxEntries.
 //
 // # Shrink
 //
@@ -23,7 +37,7 @@
 //
 // Each shrink uses a three-phase approach to minimise lock hold time:
 //
-//  1. Snapshot live entries under write lock (brief).
+//  1. Snapshot live entries under lock (brief).
 //  2. Build a new map from the snapshot without holding any lock.
 //  3. Delta-merge keys mutated during phase 2 and swap atomically (brief).
 //
@@ -34,13 +48,6 @@
 //
 // TTL is optional. When enabled, expired entries are removed lazily on Get,
 // or proactively by the active expiry sweep if WithActiveExpiry is set.
-//
-// # Limits
-//
-// kahora limits entry count, not bytes. For byte-aware caching, wrap kahora
-// or use a different library — keeping the API simple is a deliberate choice.
-// The maxEntries limit is enforced per-shard via atomic counters and may be
-// exceeded slightly under concurrent load.
 //
 // # Metrics
 //
@@ -56,6 +63,7 @@
 //	    kahora.WithTTL(5 * time.Minute),
 //	    kahora.WithActiveExpiry(30 * time.Second),
 //	    kahora.WithMaxEntries(10_000_000),
+//	    kahora.WithEvictionPolicy(kahora.EvictionLFU),
 //	)
 //	if err != nil {
 //	    log.Fatal(err)

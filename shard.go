@@ -8,120 +8,140 @@ import (
 
 const (
 	// cacheLineSize is the x86-64 cache line size.
-	// shard is padded to this boundary to avoid false sharing.
 	cacheLineSize = 64
 )
 
 // shard is a single cache partition.
-// Each shard is independently locked — operations on different shards never contend.
 //
-// Memory layout is explicit: RWMutex first (most frequently accessed),
-// then maps, then atomics, then padding.
-// Padding ensures no two shards share a CPU cache line.
+// All operations use a single Mutex (not RWMutex). This is a deliberate choice
+// to support EvictionLFU, which mutates state on every Get (counter increment).
+// For EvictionReject workloads with high read concurrency, this means slightly
+// more contention than a pure RWMutex would give, but keeps the type uniform
+// and the codebase simpler.
 type shard[K comparable, V any] struct {
-	mu   sync.RWMutex
+	mu   sync.Mutex
 	data map[K]entry[V]
 
-	// dirty tracks keys mutated (set or deleted) while a shrink is in progress.
-	// Allocated once at shard init, cleared between shrink cycles via clear().
-	// Only populated when shrinking == true.
-	//
-	// Note: dirty contains keys that were either written OR deleted during
-	// phase 2 of shrink. Phase 3 inspects each dirty key against s.data:
-	//   - present in data → copy into new map (delta write)
-	//   - absent from data → ensure absent from new map (delta delete)
+	// LFU state — non-nil only when policy == EvictionLFU.
+	// freq holds per-key access counters; sampleSize controls eviction sampling.
+	freq       map[K]uint32
+	sampleSize int
+
+	// dirty tracks keys mutated while a shrink is in progress.
 	dirty map[K]struct{}
 
-	// shrinking signals that dirty tracking is active.
-	// Read by set/delete on the hot path — kept as atomic to allow lock-free check.
-	// Always mutated under write lock to maintain ordering with dirty map writes.
 	shrinking atomic.Bool
-
-	// count is the number of live entries in this shard.
-	// Approximate — may be slightly stale under concurrent load.
-	// Used for maxEntries enforcement and shrink eligibility fast-path.
-	count atomic.Int64
+	count     atomic.Int64
 
 	// Padding to prevent false sharing with adjacent shards in the slice.
-	// Verified by TestShardCacheLineAlignment.
 	_ [shardPadding]byte
 }
 
-// shardPadding is tuned so unsafe.Sizeof(shard{}) is a multiple of cacheLineSize.
-// Verified by TestShardCacheLineAlignment — adjust this value if the test fails.
+// shardPadding is verified by TestShardCacheLineAlignment.
 const shardPadding = 8
 
 // newShard allocates a shard with a pre-allocated map of the given hint size.
-func newShard[K comparable, V any](initialSize int) *shard[K, V] {
-	return &shard[K, V]{
+// If lfuSampleSize > 0, the shard tracks LFU counters.
+func newShard[K comparable, V any](initialSize, lfuSampleSize int) *shard[K, V] {
+	s := &shard[K, V]{
 		data:  make(map[K]entry[V], initialSize),
 		dirty: make(map[K]struct{}),
 	}
+	if lfuSampleSize > 0 {
+		s.freq = make(map[K]uint32, initialSize)
+		s.sampleSize = lfuSampleSize
+	}
+	return s
 }
 
 // get looks up key in the shard.
-// now must be the result of a single monoNow() call from the caller —
-// avoids redundant clock reads when one Get traverses multiple checks.
-//
-// Returns (value, true) on hit, (zero, false) on miss or expiry.
-// Removes expired entries lazily.
+// On hit, if LFU is enabled, the access counter is incremented.
 func (s *shard[K, V]) get(key K, now int64, metrics MetricsRecorder, shardIdx int) (V, bool) {
-	s.mu.RLock()
+	s.mu.Lock()
 	e, ok := s.data[key]
-	s.mu.RUnlock()
-
 	if !ok {
+		s.mu.Unlock()
 		metrics.RecordMiss(shardIdx)
 		var zero V
 		return zero, false
 	}
 
 	if e.isExpired(now) {
-		// Lazy eviction: upgrade to write lock and delete.
-		// Re-check under write lock — another goroutine may have already deleted
-		// or replaced the entry between our RUnlock and Lock.
-		evicted := false
-
-		s.mu.Lock()
-		if e2, still := s.data[key]; still && e2.isExpired(now) {
-			delete(s.data, key)
-			s.count.Add(-1)
-			if s.shrinking.Load() {
-				s.dirty[key] = struct{}{}
-			}
-			evicted = true
+		delete(s.data, key)
+		s.count.Add(-1)
+		if s.freq != nil {
+			delete(s.freq, key)
+		}
+		if s.shrinking.Load() {
+			s.dirty[key] = struct{}{}
 		}
 		s.mu.Unlock()
 
-		// Metrics outside the lock — never block writers on metric backends.
-		if evicted {
-			metrics.RecordLazyEviction(shardIdx)
-		}
+		metrics.RecordLazyEviction(shardIdx)
 		metrics.RecordMiss(shardIdx)
 		var zero V
 		return zero, false
 	}
 
+	// LFU touch — increment counter, saturating at MaxUint32.
+	if s.freq != nil {
+		c := s.freq[key]
+		if c < ^uint32(0) {
+			s.freq[key] = c + 1
+		}
+	}
+
+	s.mu.Unlock()
 	metrics.RecordHit(shardIdx)
 	return e.value, true
 }
 
 // set writes key/value into the shard.
-// expiresAt == 0 means no TTL.
-// Returns ErrCapacityExceeded if the shard is at its per-shard entry limit.
+// Behaviour when shard is at limit:
+//   - shardLimit == 0: no limit, always inserts.
+//   - LFU enabled: evicts a victim, then inserts. Returns nil.
+//   - LFU disabled (Reject mode): returns ErrCapacityExceeded.
 func (s *shard[K, V]) set(key K, value V, expiresAt int64, shardLimit int, metrics MetricsRecorder, shardIdx int) error {
+	evicted := false
+
 	s.mu.Lock()
 
 	_, exists := s.data[key]
+
 	if !exists && shardLimit > 0 && int(s.count.Load()) >= shardLimit {
-		s.mu.Unlock()
-		metrics.RecordCapacityExceeded(shardIdx)
-		return ErrCapacityExceeded
+		if s.freq != nil {
+			// LFU: evict a victim to make room.
+			victim, found := s.sampleVictim()
+			if found {
+				delete(s.data, victim)
+				delete(s.freq, victim)
+				s.count.Add(-1)
+				if s.shrinking.Load() {
+					s.dirty[victim] = struct{}{}
+				}
+				evicted = true
+			}
+			// If sampleVictim found nothing (shouldn't happen when count >= shardLimit > 0),
+			// fall through and insert anyway — capacity is approximate by design.
+		} else {
+			// Reject: refuse the write.
+			s.mu.Unlock()
+			metrics.RecordCapacityExceeded(shardIdx)
+			return ErrCapacityExceeded
+		}
 	}
 
 	s.data[key] = entry[V]{
 		value:     value,
 		expiresAt: expiresAt,
+	}
+
+	if s.freq != nil {
+		// New entries start at counter 0 — they must prove their worth.
+		// Existing entries keep their counter (don't reset on overwrite).
+		if !exists {
+			s.freq[key] = 0
+		}
 	}
 
 	if s.shrinking.Load() {
@@ -134,21 +154,52 @@ func (s *shard[K, V]) set(key K, value V, expiresAt int64, shardLimit int, metri
 
 	s.mu.Unlock()
 
+	if evicted {
+		metrics.RecordEviction(shardIdx)
+	}
 	metrics.RecordSet(shardIdx)
 	return nil
 }
 
+// sampleVictim picks an LFU eviction victim by scanning up to sampleSize
+// random entries from the freq map and returning the one with the lowest counter.
+// Caller must hold s.mu.
+//
+// Go map iteration order is randomised by the runtime — no separate RNG needed.
+func (s *shard[K, V]) sampleVictim() (K, bool) {
+	var (
+		minKey  K
+		minFreq uint32 = ^uint32(0)
+		seen    int
+		found   bool
+	)
+
+	for k, f := range s.freq {
+		if !found || f < minFreq {
+			minKey = k
+			minFreq = f
+			found = true
+		}
+		seen++
+		if seen >= s.sampleSize {
+			break
+		}
+	}
+
+	return minKey, found
+}
+
 // delete removes key from the shard.
-// No-op if key does not exist.
 func (s *shard[K, V]) delete(key K, metrics MetricsRecorder, shardIdx int) {
 	s.mu.Lock()
 	_, exists := s.data[key]
 	if exists {
 		delete(s.data, key)
 		s.count.Add(-1)
+		if s.freq != nil {
+			delete(s.freq, key)
+		}
 		if s.shrinking.Load() {
-			// Mark key as mutated so phase 3 of shrink sees the deletion.
-			// Without this, a key deleted during phase 2 would survive in newData.
 			s.dirty[key] = struct{}{}
 		}
 	}
@@ -160,8 +211,6 @@ func (s *shard[K, V]) delete(key K, metrics MetricsRecorder, shardIdx int) {
 }
 
 // sweepExpired removes all expired entries from the shard.
-// Counts evictions locally and records metrics after releasing the lock —
-// metric backends never block other writers.
 func (s *shard[K, V]) sweepExpired(now int64, metrics MetricsRecorder, shardIdx int) {
 	evicted := 0
 
@@ -170,6 +219,9 @@ func (s *shard[K, V]) sweepExpired(now int64, metrics MetricsRecorder, shardIdx 
 		if e.isExpired(now) {
 			delete(s.data, k)
 			s.count.Add(-1)
+			if s.freq != nil {
+				delete(s.freq, k)
+			}
 			if s.shrinking.Load() {
 				s.dirty[k] = struct{}{}
 			}
@@ -183,23 +235,33 @@ func (s *shard[K, V]) sweepExpired(now int64, metrics MetricsRecorder, shardIdx 
 	}
 }
 
+// ageFreq halves all LFU counters. Called periodically to prevent unbounded
+// growth and to allow historically hot but currently cold keys to be evicted.
+// No-op if LFU is disabled.
+func (s *shard[K, V]) ageFreq() {
+	if s.freq == nil {
+		return
+	}
+	s.mu.Lock()
+	for k, f := range s.freq {
+		s.freq[k] = f / 2
+	}
+	s.mu.Unlock()
+}
+
 // maybeShrink reconstructs the shard's map if eligible.
-// Three-phase approach minimises lock hold time:
 //
-//	Phase 1 (write lock, brief): set shrinking flag, snapshot live keys.
-//	Phase 2 (no lock): build a new map from the snapshot — the slow part.
-//	Phase 3 (write lock, brief): delta-merge dirty keys, swap, clear flag.
+// Three-phase approach:
 //
-// The shrinking flag MUST be set under write lock together with the snapshot —
-// any later set/delete will see the flag and record into dirty, guaranteeing
-// no mutation is lost during phase 2.
+//	Phase 1 (locked, brief): set shrinking flag, snapshot live keys.
+//	Phase 2 (no lock): build a new map from the snapshot.
+//	Phase 3 (locked, brief): delta-merge dirty keys, swap, clear flag.
 func (s *shard[K, V]) maybeShrink(now int64, minEntries int, metrics MetricsRecorder, shardIdx int) {
-	// Fast path: skip if shard is already small enough.
 	if minEntries > 0 && int(s.count.Load()) >= minEntries {
 		return
 	}
 
-	// --- Phase 1: write lock, set flag and snapshot atomically ---
+	// --- Phase 1 ---
 	s.mu.Lock()
 	s.shrinking.Store(true)
 
@@ -214,24 +276,19 @@ func (s *shard[K, V]) maybeShrink(now int64, minEntries int, metrics MetricsReco
 	}
 	s.mu.Unlock()
 
-	// --- Phase 2: build new map without any lock ---
+	// --- Phase 2 ---
 	newData := make(map[K]entry[V], len(keys))
 	for i, k := range keys {
 		newData[k] = values[i]
 	}
 
-	// --- Phase 3: delta merge and swap under write lock ---
+	// --- Phase 3 ---
 	s.mu.Lock()
 
-	// Each dirty key was either written or deleted during phase 2.
-	// Presence in s.data is the source of truth at swap time —
-	// we don't compare timestamps because s.data already holds the latest version.
 	for k := range s.dirty {
 		if e, ok := s.data[k]; ok {
-			// Key exists in current data — copy the latest version into newData.
 			newData[k] = e
 		} else {
-			// Key was deleted during phase 2 — ensure it is absent from newData.
 			delete(newData, k)
 		}
 	}
@@ -239,6 +296,17 @@ func (s *shard[K, V]) maybeShrink(now int64, minEntries int, metrics MetricsReco
 	after := len(newData)
 	s.data = newData
 	s.count.Store(int64(after))
+
+	// Reconstruct freq map to drop entries that no longer exist in data.
+	if s.freq != nil {
+		newFreq := make(map[K]uint32, after)
+		for k := range newData {
+			if f, ok := s.freq[k]; ok {
+				newFreq[k] = f
+			}
+		}
+		s.freq = newFreq
+	}
 
 	clear(s.dirty)
 	s.shrinking.Store(false)
@@ -249,7 +317,6 @@ func (s *shard[K, V]) maybeShrink(now int64, minEntries int, metrics MetricsReco
 }
 
 // shardSize returns unsafe.Sizeof of the shard struct.
-// Used by TestShardCacheLineAlignment to verify padding.
 func shardSize[K comparable, V any]() uintptr {
 	var s shard[K, V]
 	return unsafe.Sizeof(s)

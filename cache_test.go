@@ -65,7 +65,6 @@ func TestDelete(t *testing.T) {
 
 func TestDeleteNonExistent(t *testing.T) {
 	c := newCache(t)
-	// Should not panic.
 	c.Delete("ghost")
 }
 
@@ -75,14 +74,12 @@ func TestTTLExpiry(t *testing.T) {
 	c := newCache(t, kahora.WithTTL(50*time.Millisecond))
 	c.Set("k", "v")
 
-	// Should be alive immediately.
 	if _, ok := c.Get("k"); !ok {
 		t.Fatal("expected hit before TTL, got miss")
 	}
 
 	time.Sleep(100 * time.Millisecond)
 
-	// Should be expired now.
 	if _, ok := c.Get("k"); ok {
 		t.Fatal("expected miss after TTL, got hit")
 	}
@@ -105,9 +102,6 @@ func TestActiveExpiry(t *testing.T) {
 	c.Set("k", "v")
 	time.Sleep(100 * time.Millisecond)
 
-	// After TTL + sweep, entry should be gone even without a Get.
-	// We verify indirectly via metrics.
-	// Direct map access is internal — so we just verify Get misses.
 	_, ok := c.Get("k")
 	if ok {
 		t.Fatal("expected miss after active expiry, got hit")
@@ -116,8 +110,7 @@ func TestActiveExpiry(t *testing.T) {
 
 // --- Capacity ---
 
-func TestMaxEntriesExceeded(t *testing.T) {
-	// Use XS shards and a small limit so we can fill one shard deterministically.
+func TestMaxEntriesExceededReject(t *testing.T) {
 	c := newCache(t,
 		kahora.WithShardCount(kahora.ShardCountXS),
 		kahora.WithMaxEntries(16),
@@ -133,7 +126,91 @@ func TestMaxEntriesExceeded(t *testing.T) {
 		}
 	}
 	if !exceeded {
-		t.Fatal("expected ErrCapacityExceeded, never got it")
+		t.Fatal("expected ErrCapacityExceeded with EvictionReject, never got it")
+	}
+}
+
+// --- LFU ---
+
+func TestLFUNeverReturnsCapacityExceeded(t *testing.T) {
+	c := newCache(t,
+		kahora.WithShardCount(kahora.ShardCountXS),
+		kahora.WithMaxEntries(16),
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+	)
+
+	for i := range 1000 {
+		key := string(rune('a'+i%26)) + string(rune('0'+i%10)) + string(rune('A'+i%5))
+		if err := c.Set(key, "v"); err != nil {
+			t.Fatalf("LFU should never reject Set, got: %v", err)
+		}
+	}
+}
+
+func TestLFUEvictsLowFrequencyKey(t *testing.T) {
+	// Use a single-shard cache (XS=16) with limit small enough to force eviction.
+	c, err := kahora.New[string, string](
+		kahora.WithShardCount(kahora.ShardCountXS),
+		kahora.WithMaxEntries(32),
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+		kahora.WithLFUSampleSize(64), // sample everything for deterministic test
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Fill cache and make "hot" be hot.
+	c.Set("hot", "v")
+	for range 100 {
+		c.Get("hot")
+	}
+
+	// Add many other keys, each touched once.
+	for i := range 1000 {
+		key := "cold-" + string(rune('a'+i%26)) + string(rune('0'+i%10))
+		c.Set(key, "v")
+	}
+
+	// "hot" should still be present — its counter is highest.
+	if _, ok := c.Get("hot"); !ok {
+		t.Fatal("expected 'hot' to survive LFU pressure, but it was evicted")
+	}
+}
+
+func TestLFURequiresMaxEntries(t *testing.T) {
+	_, err := kahora.New[string, string](
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+	)
+	if err == nil {
+		t.Fatal("expected error: LFU without MaxEntries should fail")
+	}
+}
+
+func TestLFUMetricsRecordEviction(t *testing.T) {
+	r := kahora.NewRecorder(kahora.ShardCountXS)
+	c, err := kahora.New[string, string](
+		kahora.WithShardCount(kahora.ShardCountXS),
+		kahora.WithMaxEntries(16),
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+		kahora.WithMetricsRecorder(r),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	for i := range 200 {
+		key := string(rune('a'+i%26)) + string(rune('0'+i%10))
+		c.Set(key, "v")
+	}
+
+	snap := r.Snapshot()
+	if snap.Evictions == 0 {
+		t.Fatal("expected non-zero evictions, got 0")
+	}
+	if snap.CapacityExceeded != 0 {
+		t.Fatalf("expected zero CapacityExceeded with LFU, got %d", snap.CapacityExceeded)
 	}
 }
 
@@ -142,7 +219,7 @@ func TestMaxEntriesExceeded(t *testing.T) {
 func TestCloseIdempotent(t *testing.T) {
 	c := newCache(t)
 	c.Close()
-	c.Close() // must not panic
+	c.Close()
 }
 
 func TestSetAfterClose(t *testing.T) {
@@ -158,7 +235,6 @@ func TestGetAfterClose(t *testing.T) {
 	c := newCache(t)
 	c.Set("k", "v")
 	c.Close()
-	// Get should still return the value — static snapshot.
 	v, ok := c.Get("k")
 	if !ok {
 		t.Fatal("expected hit after close, got miss")
@@ -182,6 +258,10 @@ func TestInvalidOptions(t *testing.T) {
 		{"active expiry without ttl", []kahora.Option{kahora.WithActiveExpiry(time.Second)}},
 		{"nil metrics recorder", []kahora.Option{kahora.WithMetricsRecorder(nil)}},
 		{"zero shrink cycle", []kahora.Option{kahora.WithShrinkCycleInterval(0)}},
+		{"lfu sample size too small", []kahora.Option{kahora.WithLFUSampleSize(1)}},
+		{"lfu sample size too large", []kahora.Option{kahora.WithLFUSampleSize(100)}},
+		{"lfu aging interval zero", []kahora.Option{kahora.WithLFUAgingInterval(0)}},
+		{"lfu without max entries", []kahora.Option{kahora.WithEvictionPolicy(kahora.EvictionLFU)}},
 	}
 
 	for _, tt := range tests {
@@ -204,8 +284,8 @@ func TestDefaultRecorderHitsAndMisses(t *testing.T) {
 	)
 
 	c.Set("k", "v")
-	c.Get("k")       // hit
-	c.Get("missing") // miss
+	c.Get("k")
+	c.Get("missing")
 
 	snap := r.Snapshot()
 	if snap.Hits != 1 {
@@ -229,7 +309,7 @@ func TestDefaultRecorderLazyEviction(t *testing.T) {
 
 	c.Set("k", "v")
 	time.Sleep(60 * time.Millisecond)
-	c.Get("k") // triggers lazy eviction
+	c.Get("k")
 
 	snap := r.Snapshot()
 	if snap.LazyEvictions != 1 {
@@ -244,7 +324,6 @@ func TestDefaultRecorderPerShardDistribution(t *testing.T) {
 		kahora.WithMetricsRecorder(r),
 	)
 
-	// Write enough keys to spread across shards.
 	for i := range 160 {
 		c.Set(string(rune(i)), "v")
 	}
@@ -254,7 +333,6 @@ func TestDefaultRecorderPerShardDistribution(t *testing.T) {
 		t.Fatalf("expected %d shard snapshots, got %d", kahora.ShardCountXS, len(snap.Shards))
 	}
 
-	// Verify at least some shards received writes — distribution is not all-zero.
 	nonZero := 0
 	for _, s := range snap.Shards {
 		if s.Sets > 0 {
@@ -268,8 +346,6 @@ func TestDefaultRecorderPerShardDistribution(t *testing.T) {
 
 // --- Concurrency ---
 
-// TestConcurrentSetGet verifies no data races under heavy concurrent load.
-// Run with: go test -race ./...
 func TestConcurrentSetGet(t *testing.T) {
 	c := newCache(t, kahora.WithShardCount(kahora.ShardCountS))
 	var wg sync.WaitGroup
@@ -290,7 +366,6 @@ func TestConcurrentSetGet(t *testing.T) {
 	wg.Wait()
 }
 
-// TestConcurrentSetDelete verifies no data races between Set and Delete.
 func TestConcurrentSetDelete(t *testing.T) {
 	c := newCache(t)
 	var wg sync.WaitGroup
@@ -304,6 +379,35 @@ func TestConcurrentSetDelete(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			c.Delete(string(rune('a' + i%26)))
+		}(i)
+	}
+	wg.Wait()
+}
+
+func TestConcurrentLFU(t *testing.T) {
+	c, err := kahora.New[int, int](
+		kahora.WithShardCount(kahora.ShardCountS),
+		kahora.WithMaxEntries(1024),
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	var wg sync.WaitGroup
+	workers := 50
+	ops := 1000
+
+	for i := range workers {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := range ops {
+				key := (id*ops + j) % 5000
+				c.Set(key, j)
+				c.Get(key)
+			}
 		}(i)
 	}
 	wg.Wait()

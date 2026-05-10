@@ -17,6 +17,37 @@ const (
 	ShardCountXL ShardCount = 4096
 )
 
+// EvictionPolicy controls behaviour when Set is called on a full cache.
+//
+// EvictionReject (default): Set returns ErrCapacityExceeded.
+// The caller decides what to do — retry, log, drop the write, etc.
+// No background work, no per-key bookkeeping. Lowest overhead.
+//
+// EvictionLFU: Set evicts a victim using sampled Least-Frequently-Used.
+// Each Get increments a per-key counter; on eviction, k random entries are
+// sampled and the one with the lowest counter is removed.
+// Counters are halved periodically to age out historically hot keys
+// that are no longer accessed.
+// Requires WithMaxEntries.
+type EvictionPolicy int
+
+const (
+	EvictionReject EvictionPolicy = iota
+	EvictionLFU
+)
+
+// String returns a human-readable name. Used in error messages and logs.
+func (p EvictionPolicy) String() string {
+	switch p {
+	case EvictionReject:
+		return "reject"
+	case EvictionLFU:
+		return "lfu"
+	default:
+		return "unknown"
+	}
+}
+
 // options holds the internal configuration for Cache.
 // All fields are unexported — access only via functional options.
 type options struct {
@@ -27,20 +58,23 @@ type options struct {
 
 	// Entry limit.
 	// Enforced per-shard via atomic counters — approximate, not a hard guarantee.
-	// See WithMaxEntries for details.
 	maxEntries int // 0 means unlimited
+
+	// Eviction policy when shard limit is reached.
+	evictionPolicy EvictionPolicy
+
+	// LFU-specific tuning. Ignored unless evictionPolicy == EvictionLFU.
+	lfuSampleSize    int           // number of entries sampled per eviction
+	lfuAgingInterval time.Duration // how often counters are halved
 
 	// Metrics
 	metricsRecorder MetricsRecorder
 
-	// Shrink.
-	// Always enabled. One shard reconstructed per tick via round-robin.
-	// tick interval = shrinkCycleInterval / shardCount.
+	// Shrink. Always enabled. Round-robin, one shard per tick.
 	shrinkCycleInterval time.Duration
-	shrinkMinEntries    int // skip shrink if live entries < this value; 0 = always shrink
+	shrinkMinEntries    int
 
-	// Active expiry (background sweep).
-	// Requires ttl > 0.
+	// Active expiry (background sweep). Requires ttl > 0.
 	activeExpiry         bool
 	activeExpiryInterval time.Duration
 }
@@ -52,6 +86,9 @@ type Option func(*options) error
 func defaultOptions() options {
 	return options{
 		shardCount:          ShardCountM,
+		evictionPolicy:      EvictionReject,
+		lfuSampleSize:       5,
+		lfuAgingInterval:    60 * time.Second,
 		shrinkCycleInterval: 60 * time.Second,
 		shrinkMinEntries:    0,
 	}
@@ -66,13 +103,16 @@ func (o *options) validate() error {
 	if o.activeExpiry && o.activeExpiryInterval <= 0 {
 		return errors.New("kahora: active expiry interval must be positive")
 	}
+	if o.evictionPolicy == EvictionLFU && o.maxEntries == 0 {
+		return errors.New("kahora: EvictionLFU requires WithMaxEntries to be set")
+	}
 	return nil
 }
 
 // --- Public Option constructors ---
 
 // WithShardCount sets the number of shards.
-// Use ShardCount* constants (XS/S/M/L/XL) or a custom positive value.
+// Use ShardCount* constants (XS/S/M/L/XL) or a custom positive power of two.
 // Default: ShardCountM (256).
 func WithShardCount(n ShardCount) Option {
 	return func(o *options) error {
@@ -101,16 +141,81 @@ func WithTTL(ttl time.Duration) Option {
 }
 
 // WithMaxEntries sets a best-effort cap on total live entries across all shards.
-// The limit is enforced per-shard via atomic counters and may be exceeded
-// slightly under concurrent load. This is intentional — avoiding a global
-// lock on the hot path is worth the approximation.
-// 0 means unlimited.
+// Enforced per-shard via atomic counters — may be exceeded slightly under
+// concurrent load. 0 means unlimited.
+//
+// Required for EvictionLFU. Without a limit, eviction has nothing to do.
 func WithMaxEntries(n int) Option {
 	return func(o *options) error {
 		if n < 0 {
 			return errors.New("kahora: max entries must be non-negative")
 		}
 		o.maxEntries = n
+		return nil
+	}
+}
+
+// WithEvictionPolicy sets the eviction policy used when a shard reaches
+// its share of maxEntries.
+//
+// EvictionReject (default): Set returns ErrCapacityExceeded.
+// EvictionLFU: evict the least-frequently-used entry from a random sample.
+//
+// EvictionLFU requires WithMaxEntries to be set.
+//
+// Note: enabling EvictionLFU disables read-write lock concurrency for Get —
+// every Get must increment a counter under a write lock. Expect Get latency
+// to increase noticeably under high read concurrency. Measure your workload.
+func WithEvictionPolicy(p EvictionPolicy) Option {
+	return func(o *options) error {
+		switch p {
+		case EvictionReject, EvictionLFU:
+			o.evictionPolicy = p
+			return nil
+		default:
+			return errors.New("kahora: unknown eviction policy")
+		}
+	}
+}
+
+// WithLFUSampleSize sets the number of random entries sampled when LFU
+// chooses a victim. The entry with the lowest access counter among the
+// sampled set is evicted.
+//
+// Larger sample → eviction decision closer to true LFU, higher hit rate,
+// but more work per eviction (linear in sample size).
+// Smaller sample → faster eviction, slightly worse hit rate.
+//
+// Default: 5. Redis uses 5 by default with similar reasoning.
+// Range: 2 to 64. Values outside this range are rejected.
+//
+// Has no effect unless EvictionLFU is selected.
+func WithLFUSampleSize(k int) Option {
+	return func(o *options) error {
+		if k < 2 || k > 64 {
+			return errors.New("kahora: lfu sample size must be between 2 and 64")
+		}
+		o.lfuSampleSize = k
+		return nil
+	}
+}
+
+// WithLFUAgingInterval sets how often LFU counters are halved.
+// Halving prevents unbounded counter growth and lets historically hot
+// but currently cold keys be evicted again.
+//
+// Higher value = counters age slower, hot keys stay hot longer.
+// Lower value = faster forgetting, more responsive to changing access patterns.
+//
+// Default: 60s.
+//
+// Has no effect unless EvictionLFU is selected.
+func WithLFUAgingInterval(d time.Duration) Option {
+	return func(o *options) error {
+		if d <= 0 {
+			return errors.New("kahora: lfu aging interval must be positive")
+		}
+		o.lfuAgingInterval = d
 		return nil
 	}
 }
@@ -129,7 +234,6 @@ func WithMetricsRecorder(r MetricsRecorder) Option {
 
 // WithShrinkCycleInterval sets the duration of one full shrink cycle across all shards.
 // Internally: tick = cycleInterval / shardCount. One shard per tick, round-robin.
-// Higher value = less frequent reconstruction, lower CPU/alloc pressure.
 // Default: 60s (tick ~234ms for 256 shards).
 func WithShrinkCycleInterval(d time.Duration) Option {
 	return func(o *options) error {
@@ -143,7 +247,6 @@ func WithShrinkCycleInterval(d time.Duration) Option {
 
 // WithShrinkMinEntries sets the minimum number of live entries required
 // for a shard to be eligible for reconstruction.
-// Shards below this threshold are skipped — already small enough.
 // 0 means always reconstruct when the cycle reaches this shard.
 // Default: 0.
 func WithShrinkMinEntries(n int) Option {
@@ -157,8 +260,7 @@ func WithShrinkMinEntries(n int) Option {
 }
 
 // WithActiveExpiry enables a background goroutine that proactively sweeps
-// shards and deletes expired entries. Without this, expiry is lazy —
-// stale entries are only evicted on Get.
+// shards and deletes expired entries.
 // Requires WithTTL to be set.
 func WithActiveExpiry(interval time.Duration) Option {
 	return func(o *options) error {

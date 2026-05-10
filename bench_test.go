@@ -12,8 +12,6 @@ import (
 
 // --- Hot path benchmarks ---
 
-// BenchmarkGetHit measures Get on existing keys — the hottest path.
-// Pre-populates the cache, then reads in a tight loop.
 func BenchmarkGetHit(b *testing.B) {
 	c, err := kahora.New[int, int](kahora.WithShardCount(kahora.ShardCountM))
 	if err != nil {
@@ -34,8 +32,30 @@ func BenchmarkGetHit(b *testing.B) {
 	}
 }
 
-// BenchmarkGetMiss measures Get on missing keys —
-// stresses the lookup path without value copy.
+func BenchmarkGetHitLFU(b *testing.B) {
+	c, err := kahora.New[int, int](
+		kahora.WithShardCount(kahora.ShardCountM),
+		kahora.WithMaxEntries(200_000),
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+
+	const n = 100_000
+	for i := range n {
+		c.Set(i, i)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; b.Loop(); i++ {
+		c.Get(i % n)
+	}
+}
+
 func BenchmarkGetMiss(b *testing.B) {
 	c, err := kahora.New[int, int]()
 	if err != nil {
@@ -51,8 +71,6 @@ func BenchmarkGetMiss(b *testing.B) {
 	}
 }
 
-// BenchmarkSet measures Set on new keys —
-// the hottest write path including allocation.
 func BenchmarkSet(b *testing.B) {
 	c, err := kahora.New[int, int]()
 	if err != nil {
@@ -68,8 +86,6 @@ func BenchmarkSet(b *testing.B) {
 	}
 }
 
-// BenchmarkSetOverwrite measures Set on existing keys — no count change.
-// Isolates pure write cost from map growth.
 func BenchmarkSetOverwrite(b *testing.B) {
 	c, err := kahora.New[int, int]()
 	if err != nil {
@@ -90,10 +106,34 @@ func BenchmarkSetOverwrite(b *testing.B) {
 	}
 }
 
+// BenchmarkSetWithEviction measures Set cost when the cache is at limit
+// and LFU is evicting on every insert. This is the worst case for LFU.
+func BenchmarkSetWithEviction(b *testing.B) {
+	c, err := kahora.New[int, int](
+		kahora.WithShardCount(kahora.ShardCountM),
+		kahora.WithMaxEntries(10_000),
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+
+	// Pre-fill to capacity so every Set triggers eviction.
+	for i := range 10_000 {
+		c.Set(i, i)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; b.Loop(); i++ {
+		c.Set(100_000+i, i)
+	}
+}
+
 // --- Concurrent benchmarks ---
 
-// BenchmarkParallelGetHit simulates the realistic 300k+ RPS scenario:
-// many goroutines reading from a populated cache.
 func BenchmarkParallelGetHit(b *testing.B) {
 	c, err := kahora.New[int, int](kahora.WithShardCount(kahora.ShardCountM))
 	if err != nil {
@@ -118,8 +158,34 @@ func BenchmarkParallelGetHit(b *testing.B) {
 	})
 }
 
-// BenchmarkParallelMixed simulates a realistic read-heavy workload:
-// 95% Get, 5% Set. Tight contention on shared keys.
+func BenchmarkParallelGetHitLFU(b *testing.B) {
+	c, err := kahora.New[int, int](
+		kahora.WithShardCount(kahora.ShardCountM),
+		kahora.WithMaxEntries(2_000_000),
+		kahora.WithEvictionPolicy(kahora.EvictionLFU),
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+
+	const n = 1_000_000
+	for i := range n {
+		c.Set(i, i)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			c.Get(i % n)
+			i++
+		}
+	})
+}
+
 func BenchmarkParallelMixed(b *testing.B) {
 	c, err := kahora.New[int, int](kahora.WithShardCount(kahora.ShardCountM))
 	if err != nil {
@@ -148,8 +214,6 @@ func BenchmarkParallelMixed(b *testing.B) {
 	})
 }
 
-// BenchmarkParallelSet — pure write contention.
-// Worst case for sharding effectiveness.
 func BenchmarkParallelSet(b *testing.B) {
 	c, err := kahora.New[int, int](kahora.WithShardCount(kahora.ShardCountM))
 	if err != nil {
@@ -171,8 +235,6 @@ func BenchmarkParallelSet(b *testing.B) {
 
 // --- Shard count comparison ---
 
-// BenchmarkShardCounts compares contention across XS/S/M/L/XL.
-// Helps tune the default and understand the trade-off.
 func BenchmarkShardCounts(b *testing.B) {
 	cases := []struct {
 		name  string
@@ -214,8 +276,6 @@ func BenchmarkShardCounts(b *testing.B) {
 
 // --- Key types ---
 
-// BenchmarkGetStringKey measures hashing cost for string keys vs int keys.
-// String hashing is more expensive — useful to know the overhead.
 func BenchmarkGetStringKey(b *testing.B) {
 	c, err := kahora.New[string, int]()
 	if err != nil {
@@ -240,8 +300,6 @@ func BenchmarkGetStringKey(b *testing.B) {
 
 // --- TTL ---
 
-// BenchmarkGetWithTTL measures Get overhead when TTL is enabled —
-// adds the isExpired check on every hit.
 func BenchmarkGetWithTTL(b *testing.B) {
 	c, err := kahora.New[int, int](kahora.WithTTL(1 * time.Hour))
 	if err != nil {
@@ -264,9 +322,6 @@ func BenchmarkGetWithTTL(b *testing.B) {
 
 // --- Metrics overhead ---
 
-// BenchmarkGetWithDefaultRecorder measures the overhead of DefaultRecorder
-// vs nopRecorder. Critical signal — if metrics double the latency,
-// users will hesitate to enable them.
 func BenchmarkGetWithDefaultRecorder(b *testing.B) {
 	r := kahora.NewRecorder(kahora.ShardCountM)
 	c, err := kahora.New[int, int](
@@ -293,11 +348,6 @@ func BenchmarkGetWithDefaultRecorder(b *testing.B) {
 
 // --- Memory and shrink ---
 
-// BenchmarkShrinkCycle measures the cost of one full shrink cycle
-// across all shards under a realistic distribution.
-//
-// Methodology: fill, expire half, force shrink across all shards,
-// measure total time and resulting heap size.
 func BenchmarkShrinkCycle(b *testing.B) {
 	for i := 0; b.Loop(); i++ {
 		c, err := kahora.New[int, int](
@@ -310,21 +360,16 @@ func BenchmarkShrinkCycle(b *testing.B) {
 			b.Fatal(err)
 		}
 
-		// Fill cache.
 		for j := range 100_000 {
 			c.Set(j, j)
 		}
 
-		// Wait for entries to expire and shrink to run a full cycle.
 		time.Sleep(200 * time.Millisecond)
 
 		c.Close()
 	}
 }
 
-// BenchmarkSteadyStateShrink simulates the production scenario:
-// constant write/expire churn while shrink runs in background.
-// We measure Get latency under shrink pressure.
 func BenchmarkSteadyStateShrink(b *testing.B) {
 	c, err := kahora.New[int, int](
 		kahora.WithShardCount(kahora.ShardCountM),
@@ -337,7 +382,6 @@ func BenchmarkSteadyStateShrink(b *testing.B) {
 	}
 	defer c.Close()
 
-	// Background writer to keep churn going.
 	stopChurn := make(chan struct{})
 	go func() {
 		i := 0
@@ -356,7 +400,6 @@ func BenchmarkSteadyStateShrink(b *testing.B) {
 	}()
 	defer close(stopChurn)
 
-	// Let churn warm up.
 	time.Sleep(100 * time.Millisecond)
 
 	b.ResetTimer()

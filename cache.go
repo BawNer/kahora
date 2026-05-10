@@ -20,10 +20,6 @@ type Cache[K comparable, V any] struct {
 }
 
 // New creates a new Cache with the given options.
-// Returns an error if any option is invalid or options are logically inconsistent.
-//
-// New starts a background goroutine for shrink and active expiry (if enabled).
-// Always call Close when the cache is no longer needed.
 func New[K comparable, V any](opts ...Option) (*Cache[K, V], error) {
 	o := defaultOptions()
 	for _, opt := range opts {
@@ -45,9 +41,15 @@ func New[K comparable, V any](opts ...Option) (*Cache[K, V], error) {
 		initialSize = o.maxEntries / n
 	}
 
+	// Pass sampleSize > 0 to enable LFU per-shard. Reject mode passes 0.
+	lfuSampleSize := 0
+	if o.evictionPolicy == EvictionLFU {
+		lfuSampleSize = o.lfuSampleSize
+	}
+
 	shards := make([]*shard[K, V], n)
 	for i := range shards {
-		shards[i] = newShard[K, V](initialSize)
+		shards[i] = newShard[K, V](initialSize, lfuSampleSize)
 	}
 
 	c := &Cache[K, V]{
@@ -63,16 +65,15 @@ func New[K comparable, V any](opts ...Option) (*Cache[K, V], error) {
 }
 
 // Get returns the value associated with key.
-// Returns (value, true) on hit, (zero, false) on miss or expiry.
-// Expired entries are removed lazily on Get.
 func (c *Cache[K, V]) Get(key K) (V, bool) {
 	s, idx := c.shardFor(key)
 	return s.get(key, monoNow(), c.opts.metricsRecorder, idx)
 }
 
 // Set writes key/value into the cache.
-// If the key already exists, it is overwritten.
-// Returns ErrCapacityExceeded if the cache is at its maxEntries limit.
+//
+// With EvictionReject (default), Set returns ErrCapacityExceeded when the
+// shard is full. With EvictionLFU, Set evicts a victim and always succeeds.
 // Returns ErrClosed if the cache has been closed.
 func (c *Cache[K, V]) Set(key K, value V) error {
 	if c.closed.Load() {
@@ -95,17 +96,13 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 }
 
 // Delete removes key from the cache.
-// No-op if key does not exist or has already expired.
 func (c *Cache[K, V]) Delete(key K) {
 	s, idx := c.shardFor(key)
 	s.delete(key, c.opts.metricsRecorder, idx)
 }
 
 // Close stops the background goroutine and releases resources.
-// After Close, Set returns ErrClosed. Get and Delete remain safe to call
-// but operate on a static snapshot — no further eviction or shrink occurs.
-//
-// Close is idempotent — safe to call multiple times.
+// Idempotent.
 func (c *Cache[K, V]) Close() {
 	if c.closed.CompareAndSwap(false, true) {
 		close(c.stop)
@@ -113,17 +110,14 @@ func (c *Cache[K, V]) Close() {
 }
 
 // shardFor returns the shard and its index for the given key.
-// Uses maphash.Comparable for zero-allocation hashing of comparable types.
-// Requires shardCount to be a power of two — enforced in WithShardCount.
 func (c *Cache[K, V]) shardFor(key K) (s *shard[K, V], idx int) {
 	h := maphash.Comparable(c.seed, key)
 	idx = int(h & uint64(len(c.shards)-1))
 	return c.shards[idx], idx
 }
 
-// background runs the shrink and active expiry loops.
-// Two independent tickers, two independent round-robin cursors.
-// Single goroutine — no per-shard goroutines.
+// background runs the shrink, active expiry, and LFU aging loops.
+// All scheduled work happens in this single goroutine — no per-shard goroutines.
 func (c *Cache[K, V]) background() {
 	n := int(c.opts.shardCount)
 
@@ -134,13 +128,24 @@ func (c *Cache[K, V]) background() {
 	var shrinkCursor int
 	var expiryCursor int
 
-	// Active expiry ticker — nil channel blocks forever when expiry is disabled.
-	// select on a nil channel is never ready — zero cost when unused.
+	// Active expiry — nil channel blocks forever when disabled.
 	var expiryCh <-chan time.Time
 	if c.opts.activeExpiry {
 		t := time.NewTicker(c.opts.activeExpiryInterval)
 		defer t.Stop()
 		expiryCh = t.C
+	}
+
+	// LFU aging — nil channel blocks forever when LFU is disabled.
+	var agingCh <-chan time.Time
+	var agingCursor int
+	agingTick := time.Duration(0)
+	if c.opts.evictionPolicy == EvictionLFU {
+		// Spread aging across shards over the cycle to avoid lock spikes.
+		agingTick = c.opts.lfuAgingInterval / time.Duration(n)
+		t := time.NewTicker(agingTick)
+		defer t.Stop()
+		agingCh = t.C
 	}
 
 	for {
@@ -162,6 +167,11 @@ func (c *Cache[K, V]) background() {
 			idx := expiryCursor % n
 			expiryCursor++
 			c.shards[idx].sweepExpired(monoNow(), c.opts.metricsRecorder, idx)
+
+		case <-agingCh:
+			idx := agingCursor % n
+			agingCursor++
+			c.shards[idx].ageFreq()
 		}
 	}
 }
