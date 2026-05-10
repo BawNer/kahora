@@ -132,7 +132,7 @@ func (s *shard[K, V]) set(key K, value V, expiresAt int64, shardLimit int, metri
 func (s *shard[K, V]) sampleVictim() (K, bool) {
 	var (
 		minKey  K
-		minFreq uint32 = ^uint32(0)
+		minFreq = ^uint32(0)
 		seen    int
 		found   bool
 	)
@@ -177,17 +177,18 @@ func (s *shard[K, V]) sweepExpired(now int64, metrics MetricsRecorder, shardIdx 
 
 	s.mu.Lock()
 	for k, e := range s.data {
-		if e.isExpired(now) {
-			delete(s.data, k)
-			s.count.Add(-1)
-			if s.freq != nil {
-				delete(s.freq, k)
-			}
-			if s.shrinking.Load() {
-				s.dirty[k] = struct{}{}
-			}
-			evicted++
+		if !e.isExpired(now) {
+			continue
 		}
+		delete(s.data, k)
+		s.count.Add(-1)
+		if s.freq != nil {
+			delete(s.freq, k)
+		}
+		if s.shrinking.Load() {
+			s.dirty[k] = struct{}{}
+		}
+		evicted++
 	}
 	s.mu.Unlock()
 
