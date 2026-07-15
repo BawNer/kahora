@@ -130,12 +130,14 @@ func (c *Cache[K, V]) background() {
 	}
 
 	// LFU access-buffer drainer. Fixed cadence if WithLFUDrainInterval was set,
-	// otherwise adaptive inside [min, max] based on last shard's fill level.
+	// otherwise adaptive inside [min, max] driven by an EMA of buffer fill.
 	var (
 		drainCh       <-chan time.Time
 		drainTimer    *time.Timer
 		drainInterval time.Duration
 		drainAdaptive bool
+		emaFill       float64
+		emaInit       bool
 	)
 	if c.opts.evictionPolicy == EvictionLFU {
 		if c.opts.lfuDrainInterval > 0 {
@@ -174,7 +176,14 @@ func (c *Cache[K, V]) background() {
 			drainCursor++
 			attempted := c.shards[idx].drainAccess(c.opts.metricsRecorder, idx)
 			if drainAdaptive {
-				drainInterval = adaptDrainInterval(drainInterval, attempted, c.opts.lfuBufferSize,
+				fill := float64(attempted) / float64(c.opts.lfuBufferSize)
+				if !emaInit {
+					emaFill = fill
+					emaInit = true
+				} else {
+					emaFill = emaAlpha*fill + (1-emaAlpha)*emaFill
+				}
+				drainInterval = adaptDrainInterval(drainInterval, emaFill,
 					c.opts.lfuDrainMinInterval, c.opts.lfuDrainMaxInterval)
 			}
 			drainTimer.Reset(drainInterval / time.Duration(n))
@@ -182,16 +191,16 @@ func (c *Cache[K, V]) background() {
 	}
 }
 
-// adaptDrainInterval halves the interval when the ring was near-full (drain is
-// falling behind) and grows it 1.5× when it was mostly empty (idle). Bounded
-// by minInterval/maxInterval so we can't runaway-drain or freeze counters.
-func adaptDrainInterval(current time.Duration, attempted uint64, bufferSize int, minInterval, maxInterval time.Duration) time.Duration {
-	if bufferSize <= 0 {
-		return current
-	}
-	// attempted may exceed bufferSize (drops); the ratio still meaningfully
-	// signals "way too slow".
-	fill := float64(attempted) / float64(bufferSize)
+// emaAlpha weights the newest fill sample when smoothing the adaptive
+// drain-interval decision. 0.25 gives new samples ~1/4 weight, damping the
+// oscillation the raw signal caused between min and max.
+const emaAlpha = 0.25
+
+// adaptDrainInterval halves the interval when the smoothed fill signals the
+// drain is falling behind and grows it 1.5× when the buffer is mostly idle.
+// Bounded by minInterval/maxInterval so we can't runaway-drain or freeze
+// counters. fill is expected to be EMA-smoothed; raw fill oscillates.
+func adaptDrainInterval(current time.Duration, fill float64, minInterval, maxInterval time.Duration) time.Duration {
 	switch {
 	case fill > 0.90:
 		d := current / 2

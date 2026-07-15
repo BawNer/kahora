@@ -60,7 +60,7 @@ func (s *shard[K, V]) getReject(key K, now int64, metrics MetricsRecorder, shard
 	e, ok := s.data[key]
 	if !ok {
 		s.mu.RUnlock()
-		metrics.RecordMiss(shardIdx)
+		metrics.Record(Event{Type: EventMiss, Shard: shardIdx})
 		var zero V
 		return zero, false
 	}
@@ -69,7 +69,7 @@ func (s *shard[K, V]) getReject(key K, now int64, metrics MetricsRecorder, shard
 		return s.getRejectExpired(key, now, metrics, shardIdx)
 	}
 	s.mu.RUnlock()
-	metrics.RecordHit(shardIdx)
+	metrics.Record(Event{Type: EventHit, Shard: shardIdx})
 	return e.value, true
 }
 
@@ -81,14 +81,14 @@ func (s *shard[K, V]) getRejectExpired(key K, now int64, metrics MetricsRecorder
 	e, ok := s.data[key]
 	if !ok {
 		s.mu.Unlock()
-		metrics.RecordMiss(shardIdx)
+		metrics.Record(Event{Type: EventMiss, Shard: shardIdx})
 		var zero V
 		return zero, false
 	}
 	if !e.isExpired(now) {
 		v := e.value
 		s.mu.Unlock()
-		metrics.RecordHit(shardIdx)
+		metrics.Record(Event{Type: EventHit, Shard: shardIdx})
 		return v, true
 	}
 	delete(s.data, key)
@@ -97,8 +97,8 @@ func (s *shard[K, V]) getRejectExpired(key K, now int64, metrics MetricsRecorder
 		s.dirty[key] = struct{}{}
 	}
 	s.mu.Unlock()
-	metrics.RecordLazyEviction(shardIdx)
-	metrics.RecordMiss(shardIdx)
+	metrics.Record(Event{Type: EventLazyEviction, Shard: shardIdx})
+	metrics.Record(Event{Type: EventMiss, Shard: shardIdx})
 	var zero V
 	return zero, false
 }
@@ -111,7 +111,7 @@ func (s *shard[K, V]) getLFU(key K, now int64, metrics MetricsRecorder, shardIdx
 	e, ok := s.data[key]
 	if !ok {
 		s.mu.RUnlock()
-		metrics.RecordMiss(shardIdx)
+		metrics.Record(Event{Type: EventMiss, Shard: shardIdx})
 		var zero V
 		return zero, false
 	}
@@ -122,7 +122,7 @@ func (s *shard[K, V]) getLFU(key K, now int64, metrics MetricsRecorder, shardIdx
 	v := e.value
 	s.mu.RUnlock()
 	s.access.record(key)
-	metrics.RecordHit(shardIdx)
+	metrics.Record(Event{Type: EventHit, Shard: shardIdx})
 	return v, true
 }
 
@@ -133,7 +133,7 @@ func (s *shard[K, V]) getLFUExpired(key K, now int64, metrics MetricsRecorder, s
 	e, ok := s.data[key]
 	if !ok {
 		s.mu.Unlock()
-		metrics.RecordMiss(shardIdx)
+		metrics.Record(Event{Type: EventMiss, Shard: shardIdx})
 		var zero V
 		return zero, false
 	}
@@ -141,7 +141,7 @@ func (s *shard[K, V]) getLFUExpired(key K, now int64, metrics MetricsRecorder, s
 		v := e.value
 		s.mu.Unlock()
 		s.access.record(key)
-		metrics.RecordHit(shardIdx)
+		metrics.Record(Event{Type: EventHit, Shard: shardIdx})
 		return v, true
 	}
 	delete(s.data, key)
@@ -151,8 +151,8 @@ func (s *shard[K, V]) getLFUExpired(key K, now int64, metrics MetricsRecorder, s
 		s.dirty[key] = struct{}{}
 	}
 	s.mu.Unlock()
-	metrics.RecordLazyEviction(shardIdx)
-	metrics.RecordMiss(shardIdx)
+	metrics.Record(Event{Type: EventLazyEviction, Shard: shardIdx})
+	metrics.Record(Event{Type: EventMiss, Shard: shardIdx})
 	var zero V
 	return zero, false
 }
@@ -180,7 +180,11 @@ func (s *shard[K, V]) drainAccess(metrics MetricsRecorder, shardIdx int) uint64 
 	}
 
 	if attempted > uint64(len(batch)) {
-		metrics.RecordAccessesDropped(shardIdx, int(attempted-uint64(len(batch))))
+		metrics.Record(Event{
+			Type:  EventAccessesDropped,
+			Shard: shardIdx,
+			Count: int(attempted - uint64(len(batch))),
+		})
 	}
 	return attempted
 }
@@ -206,7 +210,7 @@ func (s *shard[K, V]) set(key K, value V, expiresAt int64, shardLimit int, metri
 			}
 		} else {
 			s.mu.Unlock()
-			metrics.RecordCapacityExceeded(shardIdx)
+			metrics.Record(Event{Type: EventCapacityExceeded, Shard: shardIdx})
 			return ErrCapacityExceeded
 		}
 	}
@@ -228,9 +232,9 @@ func (s *shard[K, V]) set(key K, value V, expiresAt int64, shardLimit int, metri
 	s.mu.Unlock()
 
 	if evicted {
-		metrics.RecordEviction(shardIdx)
+		metrics.Record(Event{Type: EventEviction, Shard: shardIdx})
 	}
-	metrics.RecordSet(shardIdx)
+	metrics.Record(Event{Type: EventSet, Shard: shardIdx})
 	return nil
 }
 
@@ -276,7 +280,7 @@ func (s *shard[K, V]) delete(key K, metrics MetricsRecorder, shardIdx int) {
 	s.mu.Unlock()
 
 	if exists {
-		metrics.RecordDelete(shardIdx)
+		metrics.Record(Event{Type: EventDelete, Shard: shardIdx})
 	}
 }
 
@@ -301,7 +305,7 @@ func (s *shard[K, V]) sweepExpired(now int64, metrics MetricsRecorder, shardIdx 
 	s.mu.Unlock()
 
 	for range evicted {
-		metrics.RecordActiveEviction(shardIdx)
+		metrics.Record(Event{Type: EventActiveEviction, Shard: shardIdx})
 	}
 }
 
@@ -373,7 +377,12 @@ func (s *shard[K, V]) maybeShrink(now int64, minEntries int, metrics MetricsReco
 
 	s.mu.Unlock()
 
-	metrics.RecordShrink(shardIdx, before, after)
+	metrics.Record(Event{
+		Type:   EventShrink,
+		Shard:  shardIdx,
+		Before: before,
+		After:  after,
+	})
 }
 
 func shardSize[K comparable, V any]() uintptr {

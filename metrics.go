@@ -2,36 +2,77 @@ package kahora
 
 import "sync/atomic"
 
-// MetricsRecorder receives cache events. Methods are called on the hot
-// path — implementations must be non-blocking and not allocate.
+// EventType tags a cache event. New event types can be added without breaking
+// existing MetricsRecorder implementations — that is the whole point of the
+// single-method interface. Ordering is not part of the API contract; treat
+// these as opaque tags.
+type EventType uint8
+
+const (
+	EventHit EventType = iota
+	EventMiss
+	EventSet
+	EventDelete
+	EventLazyEviction
+	EventActiveEviction
+	EventEviction // policy-driven, not TTL
+	EventShrink
+	EventCapacityExceeded
+	EventAccessesDropped
+)
+
+func (t EventType) String() string {
+	switch t {
+	case EventHit:
+		return "hit"
+	case EventMiss:
+		return "miss"
+	case EventSet:
+		return "set"
+	case EventDelete:
+		return "delete"
+	case EventLazyEviction:
+		return "lazy_eviction"
+	case EventActiveEviction:
+		return "active_eviction"
+	case EventEviction:
+		return "eviction"
+	case EventShrink:
+		return "shrink"
+	case EventCapacityExceeded:
+		return "capacity_exceeded"
+	case EventAccessesDropped:
+		return "accesses_dropped"
+	default:
+		return "unknown"
+	}
+}
+
+// Event is what every cache observation delivers. Passed by value on the hot
+// path — keep it small and do not add fields without a benchmark.
+//
+// Field usage per EventType:
+//
+//	EventShrink            → Before = pre-shrink size, After = post-shrink size
+//	EventAccessesDropped   → Count  = drop count for this drain batch
+//	everything else        → Before/After/Count all zero
+type Event struct {
+	Type   EventType
+	Shard  int
+	Before int
+	After  int
+	Count  int
+}
+
+// MetricsRecorder receives cache events. Record is called on the hot path —
+// implementations must be non-blocking and not allocate.
 type MetricsRecorder interface {
-	RecordHit(shard int)
-	RecordMiss(shard int)
-	RecordSet(shard int)
-	RecordDelete(shard int)
-	RecordLazyEviction(shard int)
-	RecordActiveEviction(shard int)
-	RecordEviction(shard int) // policy-driven, not TTL
-	RecordShrink(shard, before, after int)
-	RecordCapacityExceeded(shard int)
-	// RecordAccessesDropped is only called from the LFU drainer, off the Get
-	// hot path. dropped is the count of access records that could not be
-	// buffered since the previous drain.
-	RecordAccessesDropped(shard, dropped int)
+	Record(e Event)
 }
 
 type nopRecorder struct{}
 
-func (nopRecorder) RecordHit(int)                 {}
-func (nopRecorder) RecordMiss(int)                {}
-func (nopRecorder) RecordSet(int)                 {}
-func (nopRecorder) RecordDelete(int)              {}
-func (nopRecorder) RecordLazyEviction(int)        {}
-func (nopRecorder) RecordActiveEviction(int)      {}
-func (nopRecorder) RecordEviction(int)            {}
-func (nopRecorder) RecordShrink(_, _, _ int)      {}
-func (nopRecorder) RecordCapacityExceeded(int)    {}
-func (nopRecorder) RecordAccessesDropped(_, _ int) {}
+func (nopRecorder) Record(Event) {}
 
 type shardMetrics struct {
 	hits             atomic.Int64
@@ -63,40 +104,35 @@ func NewRecorder(shardCount ShardCount) *DefaultRecorder {
 	return &DefaultRecorder{shards: make([]shardMetrics, shardCount)}
 }
 
-func (r *DefaultRecorder) RecordHit(shard int) {
-	r.shards[shard].hits.Add(1)
-	r.hits.Add(1)
-}
-
-func (r *DefaultRecorder) RecordMiss(shard int) {
-	r.shards[shard].misses.Add(1)
-	r.misses.Add(1)
-}
-
-func (r *DefaultRecorder) RecordSet(shard int) {
-	r.shards[shard].sets.Add(1)
-	r.sets.Add(1)
-}
-
-func (r *DefaultRecorder) RecordDelete(_ int)         { r.deletes.Add(1) }
-func (r *DefaultRecorder) RecordLazyEviction(_ int)   { r.lazyEvictions.Add(1) }
-func (r *DefaultRecorder) RecordActiveEviction(_ int) { r.activeEvictions.Add(1) }
-
-func (r *DefaultRecorder) RecordEviction(shard int) {
-	r.shards[shard].evictions.Add(1)
-	r.evictions.Add(1)
-}
-
-func (r *DefaultRecorder) RecordShrink(shard, before, after int) {
-	r.shards[shard].shrinkCount.Add(1)
-	r.shards[shard].lastShrinkBefore.Store(int64(before))
-	r.shards[shard].lastShrinkAfter.Store(int64(after))
-}
-
-func (r *DefaultRecorder) RecordCapacityExceeded(_ int) { r.capacityExceeded.Add(1) }
-
-func (r *DefaultRecorder) RecordAccessesDropped(_, dropped int) {
-	r.accessesDropped.Add(int64(dropped))
+func (r *DefaultRecorder) Record(e Event) {
+	switch e.Type {
+	case EventHit:
+		r.shards[e.Shard].hits.Add(1)
+		r.hits.Add(1)
+	case EventMiss:
+		r.shards[e.Shard].misses.Add(1)
+		r.misses.Add(1)
+	case EventSet:
+		r.shards[e.Shard].sets.Add(1)
+		r.sets.Add(1)
+	case EventDelete:
+		r.deletes.Add(1)
+	case EventLazyEviction:
+		r.lazyEvictions.Add(1)
+	case EventActiveEviction:
+		r.activeEvictions.Add(1)
+	case EventEviction:
+		r.shards[e.Shard].evictions.Add(1)
+		r.evictions.Add(1)
+	case EventShrink:
+		r.shards[e.Shard].shrinkCount.Add(1)
+		r.shards[e.Shard].lastShrinkBefore.Store(int64(e.Before))
+		r.shards[e.Shard].lastShrinkAfter.Store(int64(e.After))
+	case EventCapacityExceeded:
+		r.capacityExceeded.Add(1)
+	case EventAccessesDropped:
+		r.accessesDropped.Add(int64(e.Count))
+	}
 }
 
 type ShardSnapshot struct {
