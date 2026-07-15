@@ -38,13 +38,15 @@ func New[K comparable, V any](opts ...Option) (*Cache[K, V], error) {
 	}
 
 	lfuSampleSize := 0
+	lfuBufferSize := 0
 	if o.evictionPolicy == EvictionLFU {
 		lfuSampleSize = o.lfuSampleSize
+		lfuBufferSize = o.lfuBufferSize
 	}
 
 	shards := make([]*shard[K, V], n)
 	for i := range shards {
-		shards[i] = newShard[K, V](initialSize, lfuSampleSize)
+		shards[i] = newShard[K, V](initialSize, lfuSampleSize, lfuBufferSize)
 	}
 
 	c := &Cache[K, V]{
@@ -111,7 +113,7 @@ func (c *Cache[K, V]) background() {
 	shrinkTicker := time.NewTicker(c.opts.shrinkCycleInterval / time.Duration(n))
 	defer shrinkTicker.Stop()
 
-	var shrinkCursor, expiryCursor, agingCursor int
+	var shrinkCursor, expiryCursor, agingCursor, drainCursor int
 
 	var expiryCh <-chan time.Time
 	if c.opts.activeExpiry {
@@ -125,6 +127,26 @@ func (c *Cache[K, V]) background() {
 		t := time.NewTicker(c.opts.lfuAgingInterval / time.Duration(n))
 		defer t.Stop()
 		agingCh = t.C
+	}
+
+	// LFU access-buffer drainer. Fixed cadence if WithLFUDrainInterval was set,
+	// otherwise adaptive inside [min, max] based on last shard's fill level.
+	var (
+		drainCh       <-chan time.Time
+		drainTimer    *time.Timer
+		drainInterval time.Duration
+		drainAdaptive bool
+	)
+	if c.opts.evictionPolicy == EvictionLFU {
+		if c.opts.lfuDrainInterval > 0 {
+			drainInterval = c.opts.lfuDrainInterval
+		} else {
+			drainInterval = c.opts.lfuDrainMinInterval
+			drainAdaptive = true
+		}
+		drainTimer = time.NewTimer(drainInterval / time.Duration(n))
+		defer drainTimer.Stop()
+		drainCh = drainTimer.C
 	}
 
 	for {
@@ -146,6 +168,44 @@ func (c *Cache[K, V]) background() {
 			idx := agingCursor % n
 			agingCursor++
 			c.shards[idx].ageFreq()
+
+		case <-drainCh:
+			idx := drainCursor % n
+			drainCursor++
+			attempted := c.shards[idx].drainAccess(c.opts.metricsRecorder, idx)
+			if drainAdaptive {
+				drainInterval = adaptDrainInterval(drainInterval, attempted, c.opts.lfuBufferSize,
+					c.opts.lfuDrainMinInterval, c.opts.lfuDrainMaxInterval)
+			}
+			drainTimer.Reset(drainInterval / time.Duration(n))
 		}
+	}
+}
+
+// adaptDrainInterval halves the interval when the ring was near-full (drain is
+// falling behind) and grows it 1.5× when it was mostly empty (idle). Bounded
+// by min/max so we can't runaway-drain or freeze counters.
+func adaptDrainInterval(current time.Duration, attempted uint64, bufferSize int, min, max time.Duration) time.Duration {
+	if bufferSize <= 0 {
+		return current
+	}
+	// attempted may exceed bufferSize (drops); the ratio still meaningfully
+	// signals "way too slow".
+	fill := float64(attempted) / float64(bufferSize)
+	switch {
+	case fill > 0.90:
+		d := current / 2
+		if d < min {
+			d = min
+		}
+		return d
+	case fill < 0.25:
+		d := current * 3 / 2
+		if d > max {
+			d = max
+		}
+		return d
+	default:
+		return current
 	}
 }

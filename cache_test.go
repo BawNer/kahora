@@ -3,6 +3,7 @@ package kahora
 import (
 	"sync"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -14,7 +15,7 @@ func TestShardCacheLineAlignment(t *testing.T) {
 }
 
 func TestShardGetMiss(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	v, ok := s.get("key", monoNow(), nopRecorder{}, 0)
 	if ok {
 		t.Fatal("expected miss, got hit")
@@ -25,7 +26,7 @@ func TestShardGetMiss(t *testing.T) {
 }
 
 func TestShardSetGet(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	if err := s.set("key", "value", 0, 0, nopRecorder{}, 0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -39,7 +40,7 @@ func TestShardSetGet(t *testing.T) {
 }
 
 func TestShardOverwrite(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	s.set("key", "first", 0, 0, nopRecorder{}, 0)
 	s.set("key", "second", 0, 0, nopRecorder{}, 0)
 	v, ok := s.get("key", monoNow(), nopRecorder{}, 0)
@@ -52,7 +53,7 @@ func TestShardOverwrite(t *testing.T) {
 }
 
 func TestShardDelete(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	s.set("key", "value", 0, 0, nopRecorder{}, 0)
 	s.delete("key", nopRecorder{}, 0)
 	_, ok := s.get("key", monoNow(), nopRecorder{}, 0)
@@ -62,12 +63,12 @@ func TestShardDelete(t *testing.T) {
 }
 
 func TestShardDeleteNonExistent(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	s.delete("ghost", nopRecorder{}, 0)
 }
 
 func TestShardLazyExpiry(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	past := monoNow() - 1
 	s.set("key", "value", past, 0, nopRecorder{}, 0)
 
@@ -85,7 +86,7 @@ func TestShardLazyExpiry(t *testing.T) {
 }
 
 func TestShardCapacityLimitReject(t *testing.T) {
-	s := newShard[string, string](0, 0) // sampleSize=0 → reject mode
+	s := newShard[string, string](0, 0, 0) // sampleSize=0 → reject mode
 	limit := 2
 	s.set("a", "1", 0, limit, nopRecorder{}, 0)
 	s.set("b", "2", 0, limit, nopRecorder{}, 0)
@@ -96,7 +97,7 @@ func TestShardCapacityLimitReject(t *testing.T) {
 }
 
 func TestShardCapacityLimitLFU(t *testing.T) {
-	s := newShard[string, string](0, 5) // sampleSize=5 → LFU mode
+	s := newShard[string, string](0, 5, 256) // sampleSize=5 → LFU mode
 	limit := 2
 	if err := s.set("a", "1", 0, limit, nopRecorder{}, 0); err != nil {
 		t.Fatal(err)
@@ -118,7 +119,7 @@ func TestShardCapacityLimitLFU(t *testing.T) {
 }
 
 func TestShardCountAccuracy(t *testing.T) {
-	s := newShard[string, int](0, 0)
+	s := newShard[string, int](0, 0, 0)
 	s.set("a", 1, 0, 0, nopRecorder{}, 0)
 	s.set("b", 2, 0, 0, nopRecorder{}, 0)
 	s.set("a", 3, 0, 0, nopRecorder{}, 0) // overwrite — count must not increase
@@ -132,7 +133,7 @@ func TestShardCountAccuracy(t *testing.T) {
 }
 
 func TestShardSweepExpired(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	past := monoNow() - 1
 	future := monoNow() + int64(1e18)
 
@@ -157,7 +158,7 @@ func TestShardSweepExpired(t *testing.T) {
 }
 
 func TestShardShrink(t *testing.T) {
-	s := newShard[string, string](0, 0)
+	s := newShard[string, string](0, 0, 0)
 	past := monoNow() - 1
 	future := monoNow() + int64(1e18)
 
@@ -197,7 +198,7 @@ func TestShardShrinkDeltaMergeConcurrent(t *testing.T) {
 	const iterations = 50
 
 	for iter := range iterations {
-		s := newShard[int, int](0, 0)
+		s := newShard[int, int](0, 0, 0)
 		future := monoNow() + int64(1e18)
 
 		for i := range 100 {
@@ -259,7 +260,7 @@ func TestShardShrinkDeltaMergeConcurrent(t *testing.T) {
 }
 
 func TestShardConcurrentSetGet(t *testing.T) {
-	s := newShard[int, int](0, 0)
+	s := newShard[int, int](0, 0, 0)
 	var wg sync.WaitGroup
 	workers := 50
 	ops := 200
@@ -287,14 +288,16 @@ func TestShardSizeConstant(t *testing.T) {
 	}
 }
 
-// TestShardLFUFreqIncrement verifies that Get increments the LFU counter.
+// TestShardLFUFreqIncrement verifies that buffered accesses land in freq
+// once drained.
 func TestShardLFUFreqIncrement(t *testing.T) {
-	s := newShard[string, int](0, 5)
+	s := newShard[string, int](0, 5, 256)
 	s.set("k", 1, 0, 0, nopRecorder{}, 0)
 
 	for range 10 {
 		s.get("k", monoNow(), nopRecorder{}, 0)
 	}
+	s.drainAccess(nopRecorder{}, 0)
 
 	s.mu.Lock()
 	got := s.freq["k"]
@@ -307,7 +310,7 @@ func TestShardLFUFreqIncrement(t *testing.T) {
 
 // TestShardLFUAging verifies that ageFreq halves all counters.
 func TestShardLFUAging(t *testing.T) {
-	s := newShard[string, int](0, 5)
+	s := newShard[string, int](0, 5, 256)
 	s.set("k1", 1, 0, 0, nopRecorder{}, 0)
 	s.set("k2", 2, 0, 0, nopRecorder{}, 0)
 
@@ -317,6 +320,7 @@ func TestShardLFUAging(t *testing.T) {
 	for range 50 {
 		s.get("k2", monoNow(), nopRecorder{}, 0)
 	}
+	s.drainAccess(nopRecorder{}, 0)
 
 	s.ageFreq()
 
@@ -329,4 +333,86 @@ func TestShardLFUAging(t *testing.T) {
 	if s.freq["k2"] != 25 {
 		t.Errorf("expected k2 freq=25 after aging, got %d", s.freq["k2"])
 	}
+}
+
+// TestAccessBufferOverflow verifies that record-past-capacity is counted as
+// dropped and does not corrupt state.
+func TestAccessBufferOverflow(t *testing.T) {
+	s := newShard[string, int](0, 5, 4) // tiny ring
+	s.set("k", 1, 0, 0, nopRecorder{}, 0)
+
+	for range 10 {
+		s.get("k", monoNow(), nopRecorder{}, 0)
+	}
+
+	rec := &countingRecorder{}
+	attempted := s.drainAccess(rec, 0)
+
+	if attempted != 10 {
+		t.Fatalf("expected attempted=10, got %d", attempted)
+	}
+	if rec.dropped != 6 {
+		t.Fatalf("expected 6 dropped accesses (10 - buffer 4), got %d", rec.dropped)
+	}
+
+	s.mu.Lock()
+	got := s.freq["k"]
+	s.mu.Unlock()
+	if got != 4 {
+		t.Fatalf("expected freq=4 (buffer capacity), got %d", got)
+	}
+}
+
+// TestDrainSkipsDeletedKey ensures the alive guard prevents resurrecting a
+// key's freq entry after Delete.
+func TestDrainSkipsDeletedKey(t *testing.T) {
+	s := newShard[string, int](0, 5, 256)
+	s.set("k", 1, 0, 0, nopRecorder{}, 0)
+	s.get("k", monoNow(), nopRecorder{}, 0)
+	s.delete("k", nopRecorder{}, 0)
+
+	s.drainAccess(nopRecorder{}, 0)
+
+	s.mu.Lock()
+	_, ok := s.freq["k"]
+	s.mu.Unlock()
+	if ok {
+		t.Fatalf("freq must not contain deleted key")
+	}
+}
+
+// TestAdaptDrainInterval covers the adaptive scheduler's three branches.
+func TestAdaptDrainInterval(t *testing.T) {
+	min := 50 * time.Millisecond
+	max := 1 * time.Second
+
+	// Full ring → halve, but not below min.
+	if got := adaptDrainInterval(200*time.Millisecond, 250, 256, min, max); got != 100*time.Millisecond {
+		t.Errorf("fill>0.9 should halve: got %v", got)
+	}
+	if got := adaptDrainInterval(60*time.Millisecond, 300, 256, min, max); got != min {
+		t.Errorf("fill>0.9 must clamp to min: got %v", got)
+	}
+
+	// Idle → grow 1.5×, but not above max.
+	if got := adaptDrainInterval(200*time.Millisecond, 10, 256, min, max); got != 300*time.Millisecond {
+		t.Errorf("fill<0.25 should grow: got %v", got)
+	}
+	if got := adaptDrainInterval(900*time.Millisecond, 0, 256, min, max); got != max {
+		t.Errorf("fill<0.25 must clamp to max: got %v", got)
+	}
+
+	// Middle band → unchanged.
+	if got := adaptDrainInterval(200*time.Millisecond, 128, 256, min, max); got != 200*time.Millisecond {
+		t.Errorf("mid fill should keep current: got %v", got)
+	}
+}
+
+type countingRecorder struct {
+	nopRecorder
+	dropped int
+}
+
+func (r *countingRecorder) RecordAccessesDropped(_, dropped int) {
+	r.dropped += dropped
 }

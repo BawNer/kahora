@@ -10,6 +10,32 @@ Once `1.0.0` is released, breaking changes will only happen in major versions.
 
 ## [Unreleased]
 
+### Added
+
+- `WithLFUBufferSize(n)` — per-shard access-ring capacity (default 256).
+- `WithLFUDrainAdaptive(min, max)` — adaptive drain cadence (default,
+  50ms..1s).
+- `WithLFUDrainInterval(d)` — fixed drain cadence, mutually exclusive with
+  the adaptive form; last option set wins.
+- `MetricsRecorder.RecordAccessesDropped(shard, dropped)` — surfaces access
+  records that could not be buffered between drains. `Snapshot.AccessesDropped`
+  aggregates it. Off the Get hot path; diagnostic only.
+
+### Changed
+
+- **Breaking (internal):** shard mutex reverted to `sync.RWMutex`. Reject-mode
+  `Get` is back on the RLock hot path — restores v0.1.0-class parallel read
+  throughput (~24 ns/op vs v0.2.0's ~68 ns/op at 10 cores).
+- LFU `Get` now runs under RLock too. The counter update is deferred: `Get`
+  records the accessed key into a per-shard ring; a background drainer folds
+  the batch into `freq`. Counters lag reality by up to the drain interval and
+  may drop accesses when the ring fills between drains — accepted imprecision
+  in exchange for RLock-only reads.
+- **Breaking (public interface):** `MetricsRecorder` gains
+  `RecordAccessesDropped`. Third-party implementations must add a (no-op is
+  fine) method.
+
+
 ## [0.2.0] - 2026-05-10
 
 ### Added

@@ -44,6 +44,13 @@ type options struct {
 	lfuSampleSize    int
 	lfuAgingInterval time.Duration
 
+	// lfuDrainInterval > 0 → fixed drainer cadence.
+	// Otherwise the drainer adapts inside [lfuDrainMinInterval, lfuDrainMaxInterval].
+	lfuDrainInterval    time.Duration
+	lfuDrainMinInterval time.Duration
+	lfuDrainMaxInterval time.Duration
+	lfuBufferSize       int
+
 	metricsRecorder MetricsRecorder
 
 	shrinkCycleInterval time.Duration
@@ -61,6 +68,9 @@ func defaultOptions() options {
 		evictionPolicy:      EvictionReject,
 		lfuSampleSize:       5,
 		lfuAgingInterval:    60 * time.Second,
+		lfuDrainMinInterval: 50 * time.Millisecond,
+		lfuDrainMaxInterval: 1 * time.Second,
+		lfuBufferSize:       256,
 		shrinkCycleInterval: 60 * time.Second,
 	}
 }
@@ -145,6 +155,50 @@ func WithLFUAgingInterval(d time.Duration) Option {
 			return errors.New("kahora: lfu aging interval must be positive")
 		}
 		o.lfuAgingInterval = d
+		return nil
+	}
+}
+
+// WithLFUDrainAdaptive lets the drainer's per-shard visit cadence float
+// inside [min, max] based on how full the access ring is at drain time.
+// This is the default (min=50ms, max=1s). Mutually exclusive with
+// WithLFUDrainInterval — last option set wins.
+func WithLFUDrainAdaptive(min, max time.Duration) Option {
+	return func(o *options) error {
+		if min <= 0 || max <= 0 {
+			return errors.New("kahora: lfu drain interval bounds must be positive")
+		}
+		if min > max {
+			return errors.New("kahora: lfu drain min must not exceed max")
+		}
+		o.lfuDrainMinInterval = min
+		o.lfuDrainMaxInterval = max
+		o.lfuDrainInterval = 0
+		return nil
+	}
+}
+
+// WithLFUDrainInterval fixes the drainer's per-shard visit cadence.
+// Mutually exclusive with WithLFUDrainAdaptive — last option set wins.
+func WithLFUDrainInterval(d time.Duration) Option {
+	return func(o *options) error {
+		if d <= 0 {
+			return errors.New("kahora: lfu drain interval must be positive")
+		}
+		o.lfuDrainInterval = d
+		return nil
+	}
+}
+
+// WithLFUBufferSize sets the per-shard access ring capacity. Larger = fewer
+// dropped accesses under burst, more memory (shardCount * n * sizeof(K)).
+// Default 256.
+func WithLFUBufferSize(n int) Option {
+	return func(o *options) error {
+		if n <= 0 {
+			return errors.New("kahora: lfu buffer size must be positive")
+		}
+		o.lfuBufferSize = n
 		return nil
 	}
 }

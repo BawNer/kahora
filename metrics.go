@@ -14,19 +14,24 @@ type MetricsRecorder interface {
 	RecordEviction(shard int) // policy-driven, not TTL
 	RecordShrink(shard, before, after int)
 	RecordCapacityExceeded(shard int)
+	// RecordAccessesDropped is only called from the LFU drainer, off the Get
+	// hot path. dropped is the count of access records that could not be
+	// buffered since the previous drain.
+	RecordAccessesDropped(shard, dropped int)
 }
 
 type nopRecorder struct{}
 
-func (nopRecorder) RecordHit(int)              {}
-func (nopRecorder) RecordMiss(int)             {}
-func (nopRecorder) RecordSet(int)              {}
-func (nopRecorder) RecordDelete(int)           {}
-func (nopRecorder) RecordLazyEviction(int)     {}
-func (nopRecorder) RecordActiveEviction(int)   {}
-func (nopRecorder) RecordEviction(int)         {}
-func (nopRecorder) RecordShrink(_, _, _ int)   {}
-func (nopRecorder) RecordCapacityExceeded(int) {}
+func (nopRecorder) RecordHit(int)                 {}
+func (nopRecorder) RecordMiss(int)                {}
+func (nopRecorder) RecordSet(int)                 {}
+func (nopRecorder) RecordDelete(int)              {}
+func (nopRecorder) RecordLazyEviction(int)        {}
+func (nopRecorder) RecordActiveEviction(int)      {}
+func (nopRecorder) RecordEviction(int)            {}
+func (nopRecorder) RecordShrink(_, _, _ int)      {}
+func (nopRecorder) RecordCapacityExceeded(int)    {}
+func (nopRecorder) RecordAccessesDropped(_, _ int) {}
 
 type shardMetrics struct {
 	hits             atomic.Int64
@@ -51,6 +56,7 @@ type DefaultRecorder struct {
 	activeEvictions  atomic.Int64
 	evictions        atomic.Int64
 	capacityExceeded atomic.Int64
+	accessesDropped  atomic.Int64
 }
 
 func NewRecorder(shardCount ShardCount) *DefaultRecorder {
@@ -89,6 +95,10 @@ func (r *DefaultRecorder) RecordShrink(shard, before, after int) {
 
 func (r *DefaultRecorder) RecordCapacityExceeded(_ int) { r.capacityExceeded.Add(1) }
 
+func (r *DefaultRecorder) RecordAccessesDropped(_, dropped int) {
+	r.accessesDropped.Add(int64(dropped))
+}
+
 type ShardSnapshot struct {
 	Index            int
 	Hits             int64
@@ -109,6 +119,7 @@ type Snapshot struct {
 	ActiveEvictions  int64
 	Evictions        int64
 	CapacityExceeded int64
+	AccessesDropped  int64
 	Shards           []ShardSnapshot
 }
 
@@ -137,6 +148,7 @@ func (r *DefaultRecorder) Snapshot() Snapshot {
 		ActiveEvictions:  r.activeEvictions.Load(),
 		Evictions:        r.evictions.Load(),
 		CapacityExceeded: r.capacityExceeded.Load(),
+		AccessesDropped:  r.accessesDropped.Load(),
 		Shards:           shards,
 	}
 }
