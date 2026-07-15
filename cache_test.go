@@ -383,27 +383,27 @@ func TestDrainSkipsDeletedKey(t *testing.T) {
 
 // TestAdaptDrainInterval covers the adaptive scheduler's three branches.
 func TestAdaptDrainInterval(t *testing.T) {
-	min := 50 * time.Millisecond
-	max := 1 * time.Second
+	minInterval := 50 * time.Millisecond
+	maxInterval := 1 * time.Second
 
-	// Full ring → halve, but not below min.
-	if got := adaptDrainInterval(200*time.Millisecond, 250, 256, min, max); got != 100*time.Millisecond {
+	// Full ring → halve, but not below minInterval.
+	if got := adaptDrainInterval(200*time.Millisecond, 250, 256, minInterval, maxInterval); got != 100*time.Millisecond {
 		t.Errorf("fill>0.9 should halve: got %v", got)
 	}
-	if got := adaptDrainInterval(60*time.Millisecond, 300, 256, min, max); got != min {
+	if got := adaptDrainInterval(60*time.Millisecond, 300, 256, minInterval, maxInterval); got != minInterval {
 		t.Errorf("fill>0.9 must clamp to min: got %v", got)
 	}
 
-	// Idle → grow 1.5×, but not above max.
-	if got := adaptDrainInterval(200*time.Millisecond, 10, 256, min, max); got != 300*time.Millisecond {
+	// Idle → grow 1.5×, but not above maxInterval.
+	if got := adaptDrainInterval(200*time.Millisecond, 10, 256, minInterval, maxInterval); got != 300*time.Millisecond {
 		t.Errorf("fill<0.25 should grow: got %v", got)
 	}
-	if got := adaptDrainInterval(900*time.Millisecond, 0, 256, min, max); got != max {
+	if got := adaptDrainInterval(900*time.Millisecond, 0, 256, minInterval, maxInterval); got != maxInterval {
 		t.Errorf("fill<0.25 must clamp to max: got %v", got)
 	}
 
 	// Middle band → unchanged.
-	if got := adaptDrainInterval(200*time.Millisecond, 128, 256, min, max); got != 200*time.Millisecond {
+	if got := adaptDrainInterval(200*time.Millisecond, 128, 256, minInterval, maxInterval); got != 200*time.Millisecond {
 		t.Errorf("mid fill should keep current: got %v", got)
 	}
 }

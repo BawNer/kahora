@@ -184,8 +184,8 @@ func (c *Cache[K, V]) background() {
 
 // adaptDrainInterval halves the interval when the ring was near-full (drain is
 // falling behind) and grows it 1.5× when it was mostly empty (idle). Bounded
-// by min/max so we can't runaway-drain or freeze counters.
-func adaptDrainInterval(current time.Duration, attempted uint64, bufferSize int, min, max time.Duration) time.Duration {
+// by minInterval/maxInterval so we can't runaway-drain or freeze counters.
+func adaptDrainInterval(current time.Duration, attempted uint64, bufferSize int, minInterval, maxInterval time.Duration) time.Duration {
 	if bufferSize <= 0 {
 		return current
 	}
@@ -195,14 +195,14 @@ func adaptDrainInterval(current time.Duration, attempted uint64, bufferSize int,
 	switch {
 	case fill > 0.90:
 		d := current / 2
-		if d < min {
-			d = min
+		if d < minInterval {
+			d = minInterval
 		}
 		return d
 	case fill < 0.25:
 		d := current * 3 / 2
-		if d > max {
-			d = max
+		if d > maxInterval {
+			d = maxInterval
 		}
 		return d
 	default:

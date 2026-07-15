@@ -160,19 +160,19 @@ func WithLFUAgingInterval(d time.Duration) Option {
 }
 
 // WithLFUDrainAdaptive lets the drainer's per-shard visit cadence float
-// inside [min, max] based on how full the access ring is at drain time.
-// This is the default (min=50ms, max=1s). Mutually exclusive with
+// inside [minInterval, maxInterval] based on how full the access ring is at
+// drain time. This is the default (50ms..1s). Mutually exclusive with
 // WithLFUDrainInterval — last option set wins.
-func WithLFUDrainAdaptive(min, max time.Duration) Option {
+func WithLFUDrainAdaptive(minInterval, maxInterval time.Duration) Option {
 	return func(o *options) error {
-		if min <= 0 || max <= 0 {
+		if minInterval <= 0 || maxInterval <= 0 {
 			return errors.New("kahora: lfu drain interval bounds must be positive")
 		}
-		if min > max {
+		if minInterval > maxInterval {
 			return errors.New("kahora: lfu drain min must not exceed max")
 		}
-		o.lfuDrainMinInterval = min
-		o.lfuDrainMaxInterval = max
+		o.lfuDrainMinInterval = minInterval
+		o.lfuDrainMaxInterval = maxInterval
 		o.lfuDrainInterval = 0
 		return nil
 	}
