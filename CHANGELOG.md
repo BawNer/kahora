@@ -107,7 +107,3 @@ Initial release.
 - Benchmark suite covering hot paths, concurrency, shard counts, TTL,
   metrics overhead, and steady-state shrink pressure.
 - CI on Go 1.25 and Go 1.26 with race detector, coverage, and lint jobs.
-
-[Unreleased]: https://github.com/BawNer/kahora/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/BawNer/kahora/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/BawNer/kahora/releases/tag/v0.1.0
